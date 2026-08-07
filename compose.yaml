@@ -1,0 +1,53 @@
+name: abacus
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: abacus
+      POSTGRES_PASSWORD: abacus
+      POSTGRES_DB: abacus
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abacus -d abacus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: abacus
+      RABBITMQ_DEFAULT_PASS: abacus
+    ports:
+      - "5672:5672"    # amqp
+      - "15672:15672"  # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql+asyncpg://abacus:abacus@postgres:5432/abacus
+      BROKER_URL: amqp://abacus:abacus@rabbitmq:5672/
+      ENV: local
+    ports: ["8000:8000"]
+    # Phase 0 has no /jobs yet; once it does, switch this to job-start latency.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # Give the graceful-shutdown path room to actually run.
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:
