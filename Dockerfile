@@ -1,13 +1,25 @@
 # Multi-stage: the build toolchain never reaches the runtime image.
 FROM python:3.12-slim AS builder
 
+# Pinned, not :latest — a floating builder tool would undo the point of a lockfile.
+COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
+
 WORKDIR /app
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+
+# UV_PYTHON_PREFERENCE: use the interpreter this base image already ships. The
+# project default is only-managed, which is right on a dev laptop with five
+# pythons on PATH, but here it would download a sixth and build a venv whose
+# symlinks point at a builder path that does not exist in the runtime stage.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_PREFERENCE=only-system
 
 # Dependencies before source, so a source edit doesn't bust the install layer.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# --locked fails the build if uv.lock has drifted from pyproject.toml, rather
+# than silently resolving something new.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev
 
 
 FROM python:3.12-slim AS runtime

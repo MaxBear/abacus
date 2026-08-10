@@ -2,38 +2,33 @@
 SHELL := /bin/bash
 
 VENV := .venv
-PY   := $(VENV)/bin/python
-PIP  := $(VENV)/bin/pip
 
-.PHONY: help venv install lint fmt test up down logs rebuild verify clean
+.PHONY: help install lock lint fmt test up down logs rebuild verify clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-venv: ## Create the local 3.12 venv (uv if present, else stdlib venv)
-	@if command -v uv >/dev/null 2>&1; then \
-		uv venv --python 3.12 $(VENV); \
-	else \
-		echo "uv not found; falling back to python3 -m venv (needs python3.12 on PATH)"; \
-		python3.12 -m venv $(VENV) || python3 -m venv $(VENV); \
-	fi
+install: ## Create .venv and install exactly what uv.lock pins
+	@command -v uv >/dev/null 2>&1 || { \
+		echo "uv not found. Install it: brew install uv  (or: curl -LsSf https://astral.sh/uv/install.sh | sh)"; \
+		exit 1; \
+	}
+	uv sync --locked
 
-install: venv ## Install dev dependencies
-	@if command -v uv >/dev/null 2>&1; then \
-		VIRTUAL_ENV=$(VENV) uv pip install -r requirements-dev.txt; \
-	else \
-		$(PIP) install -r requirements-dev.txt; \
-	fi
+lock: ## Re-resolve uv.lock after editing pyproject.toml, and refresh the exported requirements
+	uv lock
+	uv export --no-dev --no-emit-project --output-file requirements.txt --quiet
+	uv export --no-emit-project --output-file requirements-dev.txt --quiet
 
 lint: ## Lint
-	$(VENV)/bin/ruff check .
+	uv run ruff check .
 
 fmt: ## Format
-	$(VENV)/bin/ruff format .
-	$(VENV)/bin/ruff check --fix .
+	uv run ruff format .
+	uv run ruff check --fix .
 
 test: ## Run tests (no containers required)
-	$(VENV)/bin/pytest
+	uv run pytest
 
 up: ## Start the stack
 	docker compose up -d --build

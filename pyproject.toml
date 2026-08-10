@@ -3,6 +3,36 @@ name = "abacus"
 version = "0.1.0"
 description = "Chat-driven portfolio analytics: a job broker with a numerical solver behind it"
 requires-python = ">=3.12,<3.13"
+# Direct deps stay exactly pinned, as in phase 0. The win from uv.lock is that
+# it now also pins the ~30 transitives (starlette, anyio, greenlet, the uvicorn
+# extras) that these lines never covered. Bump these deliberately, not as a
+# side effect of someone re-resolving.
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+    "aio-pika==9.5.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+    "httpx==0.28.1",
+    "ruff==0.8.6",
+]
+
+[tool.uv]
+# A deployed service, not a distributable library: there is nothing to build,
+# so uv installs the dependencies and leaves the source tree alone.
+package = false
+# Always use uv's own downloaded interpreter, never whatever python3 happens to
+# be first on PATH. Contributors get the same 3.12 as CI and the image.
+python-preference = "only-managed"
 
 [tool.ruff]
 line-length = 100
