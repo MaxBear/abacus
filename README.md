@@ -30,7 +30,7 @@ benchmarked)** → `3` containerized workers → `4` the analytics engine → `5
 
 ```bash
 make up          # build + start api, postgres, rabbitmq
-curl localhost:8000/healthz    # {"status":"ok"}
+curl localhost:8000/livez      # {"status":"ok"}
 curl localhost:8000/readyz     # {"status":"ready", ...}
 make verify      # Phase 0 acceptance checks
 make down
@@ -59,7 +59,7 @@ infra/       Terraform + k8s manifests.                (phase 6)
 
 ## Two decisions worth knowing about
 
-**`/healthz` and `/readyz` are different things.** Liveness checks nothing but that the process can
+**`/livez` and `/readyz` are different things.** Liveness checks nothing but that the process can
 serve a request; readiness checks Postgres and RabbitMQ concurrently, with a timeout. If liveness
 checked the database, a database blip would make the kubelet kill and restart every pod — converting
 a recoverable dependency outage into a crash loop. `tests/test_health.py` guards this.
