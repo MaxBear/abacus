@@ -12,7 +12,7 @@ async def client():
         yield c
 
 
-async def test_healthz_has_no_dependencies(client, monkeypatch):
+async def test_livez_has_no_dependencies(client, monkeypatch):
     """Liveness must stay green even when every dependency is down.
 
     This is the regression guard for the mistake the Dockerfile/k8s critique
@@ -26,7 +26,7 @@ async def test_healthz_has_no_dependencies(client, monkeypatch):
     monkeypatch.setattr("adapters.db.ping", boom)
     monkeypatch.setattr("adapters.broker.ping", boom)
 
-    resp = await client.get("/healthz")
+    resp = await client.get("/livez")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
 

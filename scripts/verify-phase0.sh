@@ -9,19 +9,19 @@ bad()  { echo "  FAIL  $1"; fail=$((fail+1)); }
 echo "== Phase 0 verification =="
 
 echo "-- liveness/readiness split"
-code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/healthz)
-[ "$code" = "200" ] && ok "/healthz 200" || bad "/healthz returned $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/livez)
+[ "$code" = "200" ] && ok "/livez 200" || bad "/livez returned $code"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/readyz)
 [ "$code" = "200" ] && ok "/readyz 200 with deps up" || bad "/readyz returned $code"
 
-echo "-- readyz fails when Postgres is down, healthz does not"
+echo "-- readyz fails when Postgres is down, livez does not"
 docker compose stop postgres >/dev/null 2>&1
 sleep 3
 rcode=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/readyz)
-hcode=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/healthz)
+hcode=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/livez)
 [ "$rcode" = "503" ] && ok "/readyz 503 with postgres down" || bad "/readyz returned $rcode (want 503)"
-[ "$hcode" = "200" ] && ok "/healthz still 200 (no crash-loop)" || bad "/healthz returned $hcode (want 200)"
+[ "$hcode" = "200" ] && ok "/livez still 200 (no crash-loop)" || bad "/livez returned $hcode (want 200)"
 docker compose start postgres >/dev/null 2>&1
 
 echo "-- image hygiene"

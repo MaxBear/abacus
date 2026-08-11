@@ -10,8 +10,8 @@ log = logging.getLogger(__name__)
 router = APIRouter(tags=["health"])
 
 
-@router.get("/healthz")
-async def healthz() -> dict[str, str]:
+@router.get("/livez")
+async def livez() -> dict[str, str]:
     """Liveness. Checks nothing but that the process can serve a request.
 
     Deliberately dependency-free. If this checked Postgres, a database blip
