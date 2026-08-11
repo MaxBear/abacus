@@ -2,7 +2,39 @@
 name = "abacus"
 version = "0.1.0"
 description = "Chat-driven portfolio analytics: a job broker with a numerical solver behind it"
+readme = "README.md"
 requires-python = ">=3.12,<3.13"
+# Lower bounds only. uv.lock holds the exact resolution, including transitives,
+# so pinning here too would just be a second thing to keep in sync.
+dependencies = [
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.10.4",
+    "pydantic-settings>=2.7.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "aio-pika>=9.5.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Flat layout, so no src/ root and no single abacus/ module to infer from the
+# project name — name the shipped packages explicitly. tests/ stays out.
+# Keep the uv_build bound above in step with the uv version pinned in the Dockerfile.
+module-root = ""
+module-name = ["adapters", "api", "core", "gateway", "worker"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.0",
+    "httpx>=0.28.1",
+    "ruff>=0.8.6",
+]
 
 [tool.ruff]
 line-length = 100

@@ -2,38 +2,28 @@
 SHELL := /bin/bash
 
 VENV := .venv
-PY   := $(VENV)/bin/python
-PIP  := $(VENV)/bin/pip
 
-.PHONY: help venv install lint fmt test up down logs rebuild verify clean
+.PHONY: help install lock lint fmt test up down logs rebuild verify clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-venv: ## Create the local 3.12 venv (uv if present, else stdlib venv)
-	@if command -v uv >/dev/null 2>&1; then \
-		uv venv --python 3.12 $(VENV); \
-	else \
-		echo "uv not found; falling back to python3 -m venv (needs python3.12 on PATH)"; \
-		python3.12 -m venv $(VENV) || python3 -m venv $(VENV); \
-	fi
+install: ## Sync .venv to uv.lock exactly (runtime + dev)
+	@command -v uv >/dev/null 2>&1 || { echo "uv required: https://docs.astral.sh/uv/getting-started/installation/"; exit 1; }
+	uv sync
 
-install: venv ## Install dev dependencies
-	@if command -v uv >/dev/null 2>&1; then \
-		VIRTUAL_ENV=$(VENV) uv pip install -r requirements-dev.txt; \
-	else \
-		$(PIP) install -r requirements-dev.txt; \
-	fi
+lock: ## Re-resolve uv.lock after editing pyproject.toml dependencies
+	uv lock
 
 lint: ## Lint
-	$(VENV)/bin/ruff check .
+	uv run ruff check .
 
 fmt: ## Format
-	$(VENV)/bin/ruff format .
-	$(VENV)/bin/ruff check --fix .
+	uv run ruff format .
+	uv run ruff check --fix .
 
 test: ## Run tests (no containers required)
-	$(VENV)/bin/pytest
+	uv run pytest
 
 up: ## Start the stack
 	docker compose up -d --build

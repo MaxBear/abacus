@@ -1,13 +1,26 @@
 # Multi-stage: the build toolchain never reaches the runtime image.
 FROM python:3.12-slim AS builder
 
+# Pinned uv binary, not `pip install uv` — no resolver run, no build toolchain.
+COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
+
+# uv defaults to .venv next to pyproject.toml; put it where the runtime expects.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
 WORKDIR /app
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
 
 # Dependencies before source, so a source edit doesn't bust the install layer.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-install-project is what makes that split possible: it resolves and
+# installs the 8 deps (plus transitives) without needing abacus itself to build.
+# --frozen fails rather than silently re-resolving if uv.lock is out of date.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Then the source, and abacus itself as a real wheel in /opt/venv.
+COPY . .
+RUN uv sync --frozen --no-dev --no-editable
 
 
 FROM python:3.12-slim AS runtime
@@ -25,7 +38,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # No secrets in ENV — ENV and ARG both persist in image history (`docker history`).
 # Config arrives at runtime via env_file / k8s Secret.
 
-COPY --chown=app:app . .
+# No source copy: abacus is installed into /opt/venv as a wheel, so api/, core/
+# and friends import from site-packages. Copying the tree here as well would
+# shadow that install (uvicorn puts cwd on sys.path) and ship tests/ besides.
 USER app
 
 EXPOSE 8000
