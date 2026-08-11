@@ -3,8 +3,8 @@ import logging
 
 from fastapi import APIRouter, Response, status
 
-from adapters import broker, db
-from core.config import get_settings
+from adapters import broker
+from api.deps import DatabaseDep, SettingsDep
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["health"])
@@ -14,23 +14,24 @@ router = APIRouter(tags=["health"])
 async def livez() -> dict[str, str]:
     """Liveness. Checks nothing but that the process can serve a request.
 
-    Deliberately dependency-free. If this checked Postgres, a database blip
-    would make the kubelet kill and restart every pod — turning a recoverable
-    dependency outage into a crash loop. Liveness answers "is this process
-    wedged?", not "is the system healthy?".
+    Deliberately dependency-free — it takes no injected dependencies at all.
+    If this checked Postgres, a database blip would make the kubelet kill and
+    restart every pod, turning a recoverable dependency outage into a crash
+    loop. Liveness answers "is this process wedged?", not "is the system
+    healthy?".
     """
     return {"status": "ok"}
 
 
 @router.get("/readyz")
-async def readyz(response: Response) -> dict[str, object]:
+async def readyz(response: Response, db: DatabaseDep, settings: SettingsDep) -> dict[str, object]:
     """Readiness. Fails when this pod cannot usefully serve traffic.
 
     Checks are run concurrently and bounded — a hung dependency must not turn
     into a hung probe.
     """
-    timeout = get_settings().readiness_timeout_seconds
-    checks = {"postgres": db.ping(), "rabbitmq": broker.ping()}
+    timeout = settings.readiness_timeout_seconds
+    checks = {"postgres": db.ping(), "rabbitmq": broker.ping(settings)}
 
     async def run(name: str, coro) -> tuple[str, str | None]:
         try:
