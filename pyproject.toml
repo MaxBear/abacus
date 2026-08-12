@@ -47,5 +47,9 @@ ignore = ["S101"]  # assert is fine in tests
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Pin what pytest-asyncio will otherwise change under us: async fixtures get a
+# fresh event loop per test, matching the announced future default. Session- or
+# module-scoped loops would let one test's leftover tasks reach the next.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-q"
