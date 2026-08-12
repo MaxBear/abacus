@@ -1,0 +1,83 @@
+name: CI
+
+# Every push on every branch, so a broken commit is visible before it reaches a
+# PR. pull_request is kept for branches pushed from forks, which never trigger
+# the push event on this repo.
+# This job runs `ruff check .` and pytest, whose only inputs are the Python
+# sources, pyproject.toml, and uv.lock. The paths below are deploy- and
+# docs-only: nothing under them can change whether lint or the suite passes.
+# Listed as ignores rather than an allowlist deliberately — an input nobody
+# thought to list still gets CI, where a missed allowlist entry would silently
+# ship untested. Revisit this list if the workflow ever builds the image.
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "**.md"
+      - "Dockerfile"
+      - "compose.yaml"
+      - ".dockerignore"
+      - ".env*"
+      - ".gitignore"
+      - "scripts/**"
+  pull_request:
+    branches: [main]
+    # Repeated verbatim: GitHub's workflow parser does not support YAML
+    # anchors, so filters cannot be shared between events. Keep the two lists
+    # in sync by hand.
+    paths-ignore:
+      - "**.md"
+      - "Dockerfile"
+      - "compose.yaml"
+      - ".dockerignore"
+      - ".env*"
+      - ".gitignore"
+      - "scripts/**"
+
+# A second push to the same branch cancels the run still in flight for it.
+# Nobody needs CI results for a commit that has already been superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # A push to a branch with an open PR fires both `push` and `pull_request`,
+    # which would run this job twice. Push already covers every branch in this
+    # repo, so the pull_request event only earns its keep for forks, whose
+    # pushes land in the fork and never trigger `push` here.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # Keyed on uv.lock: the cache is reused until the lock changes, which
+          # is exactly when the resolved set of packages changes.
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # No actions/setup-python step: pyproject sets python-preference =
+      # only-managed, so uv downloads the 3.12 named in .python-version. CI gets
+      # the same interpreter as contributors and the image, not whatever
+      # ubuntu-latest happens to ship.
+      - name: Install dependencies
+        run: make install
+
+      - name: Lint
+        run: make lint
+
+      # The suite injects fakes rather than reaching for real services, so this
+      # needs no Postgres or RabbitMQ containers. If that ever changes, add
+      # them under services: here rather than booting compose.
+      - name: Test
+        run: make test
