@@ -8,6 +8,10 @@ requires-python = ">=3.12,<3.13"
 # extras) that these lines never covered. Bump these deliberately, not as a
 # side effect of someone re-resolving.
 dependencies = [
+    # Starlette's async runtime, and a direct import since core/ws.py names its
+    # disconnect exceptions. Pinned like everything else rather than left to
+    # arrive as a transitive: an import we depend on is a dependency we declare.
+    "anyio==4.14.2",
     "fastapi==0.115.6",
     "uvicorn[standard]==0.34.0",
     "pydantic==2.10.4",

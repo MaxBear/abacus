@@ -3,7 +3,7 @@ SHELL := /bin/bash
 
 VENV := .venv
 
-.PHONY: help install lock lint fmt test up down logs rebuild verify clean
+.PHONY: help install lock lint fmt test up down logs rebuild verify chat clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -15,10 +15,8 @@ install: ## Create .venv and install exactly what uv.lock pins
 	}
 	uv sync --locked
 
-lock: ## Re-resolve uv.lock after editing pyproject.toml, and refresh the exported requirements
+lock: ## Re-resolve uv.lock after editing pyproject.toml
 	uv lock
-	uv export --no-dev --no-emit-project --output-file requirements.txt --quiet
-	uv export --no-emit-project --output-file requirements-dev.txt --quiet
 
 lint: ## Lint
 	uv run ruff check .
@@ -44,6 +42,10 @@ rebuild: ## Rebuild the api image from scratch
 
 verify: ## Phase 0 acceptance checks (see README)
 	@./scripts/verify-phase0.sh
+
+chat: ## Serve dev/chat.html — a browser client for the chat socket
+	@echo "http://localhost:8080/chat.html  (needs the api running: make up)"
+	@uv run python -m http.server 8080 --directory dev
 
 clean: ## Remove local caches and venv
 	rm -rf $(VENV) .pytest_cache .ruff_cache

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 acceptance checks, from the build plan's Verification section.
+# Phase 0 acceptance checks. See the Acceptance line under Phase 0 in docs/roadmap.md.
 set -uo pipefail
 
 pass=0; fail=0

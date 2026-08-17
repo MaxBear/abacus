@@ -22,6 +22,26 @@ class Settings(BaseSettings):
     # kubelet's probe timeout the thing that decides liveness.
     readiness_timeout_seconds: float = 2.0
 
+    # --- WebSocket transport (docs/websocket.md) ---
+
+    # Browser origins allowed to open a socket. WebSockets are exempt from the
+    # same-origin policy and CORS does not apply to them, so without this check
+    # any page on the internet can open a connection here and the browser will
+    # attach cookies. Empty is permissive only when env == "local"; anywhere
+    # else an empty list denies every browser origin, so a forgotten value
+    # fails closed.
+    ws_allowed_origins: tuple[str, ...] = ()
+
+    # Per-connection outbound buffer. Beyond this the connection is dropped
+    # rather than buffered — see the backpressure note in core/ws.py.
+    ws_send_queue_size: int = 64
+    ws_max_connections_per_session: int = 8
+    ws_max_concurrent_turns: int = 4
+
+    # Must stay well inside the container's stop_grace_period, or the drain is
+    # cut short by SIGKILL and accomplishes nothing.
+    ws_drain_timeout_seconds: float = 5.0
+
 
 @lru_cache
 def get_settings() -> Settings:

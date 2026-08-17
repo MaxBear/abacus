@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>abacus — chat socket harness</title>
+<!--
+  A hand-driven client for /ws/chat/{session_id}, for the integration testing the
+  test suite cannot do: a real browser, a real socket, real close codes.
+
+  Not the phase-5 UI and not a prototype of one — it shows raw frames on purpose.
+  Nothing here is served by the app; it is a static file, so it can be thrown away
+  the day a real client exists.
+
+    make chat        # serves this at http://localhost:8080/chat.html
+    make up          # or: uv run uvicorn api.main:app --reload
+
+  Serve it rather than opening the file directly: a file:// page sends
+  `Origin: null`, which only passes while ENV=local leaves the allowlist empty.
+  Served at :8080 you can also test the real check — set
+  WS_ALLOWED_ORIGINS=["http://localhost:8080"] and watch a wrong origin 403.
+
+  Query params make a run reproducible, and scriptable from headless Chrome:
+    ?server=ws://localhost:8000&session=<uuid>&v=1&go=1&say=hello
+-->
+
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --panel: #fff; --line: #e3e1dd; --ink: #1f1e1c; --dim: #6b6862;
+    --accent: #2f6f4e; --warn: #8a5a12; --bad: #a33a2a; --user: #eef1f6; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171815; --panel: #1e201c; --line: #33362f; --ink: #e8e6e0; --dim: #96938b;
+      --accent: #7fc39a; --warn: #d8a85c; --bad: #e8877a; --user: #262a2c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 12px; color: var(--dim); display: flex; gap: 5px; align-items: center; }
+  input[type=text], input[type=number] { font: 12px var(--mono); padding: 5px 7px; border: 1px solid var(--line);
+    border-radius: 5px; background: var(--bg); color: var(--ink); }
+  #url { width: 210px; } #session { width: 290px; } #ver { width: 46px; } #burst { width: 46px; }
+  button { font: 12px system-ui, sans-serif; padding: 5px 10px; border: 1px solid var(--line); border-radius: 5px;
+    background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+  #status { font: 12px var(--mono); padding: 6px 14px; border-bottom: 1px solid var(--line); flex: none; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line);
+    flex: 1; min-height: 0; }
+  section { background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+  .head { padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--dim); display: flex; justify-content: space-between; }
+  .body { flex: 1; overflow-y: auto; padding: 10px 12px; }
+  #log { font: 11.5px/1.45 var(--mono); white-space: pre-wrap; word-break: break-all; }
+  .l { display: flex; gap: 7px; padding: 1px 0; }
+  .l .t { color: var(--dim); flex: none; }
+  .l .d { flex: none; width: 12px; }
+  .out .d { color: var(--accent); } .in .d { color: var(--dim); } .note .d { color: var(--warn); }
+  .note { color: var(--warn); } .err { color: var(--bad); }
+  .msg { margin-bottom: 10px; }
+  .msg .who { font-size: 11px; color: var(--dim); margin-bottom: 2px; }
+  .msg .txt { padding: 7px 10px; border-radius: 7px; background: var(--user); white-space: pre-wrap; }
+  .msg.a .txt { background: transparent; border: 1px solid var(--line); }
+  .msg.e .txt { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+  .msg .meta { font: 10.5px var(--mono); color: var(--dim); margin-top: 3px; }
+  footer { padding: 10px 14px; border-top: 1px solid var(--line); background: var(--panel); flex: none; }
+  #text { width: 100%; font: 13px system-ui, sans-serif; padding: 7px 9px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--ink); resize: vertical; min-height: 46px; }
+  .probes { margin-top: 8px; }
+  .probes .lbl { font-size: 11px; color: var(--dim); margin-right: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>abacus — chat socket harness <span style="font-weight:400;color:var(--dim)">phase 1a, protocol v1</span></h1>
+  <div class="row">
+    <label>server <input id="url" type="text" value="ws://localhost:8000"></label>
+    <label>session <input id="session" type="text"></label>
+    <button id="newSession">new uuid</button>
+    <label>?v= <input id="ver" type="text" placeholder="—"></label>
+    <button id="connect" class="primary">connect</button>
+    <button id="disconnect" disabled>disconnect</button>
+    <label><input id="autoping" type="checkbox" checked> ping every 20s</label>
+  </div>
+</header>
+
+<div id="status">idle</div>
+
+<main>
+  <section>
+    <div class="head"><span>transcript</span><button id="clearT">clear</button></div>
+    <div class="body" id="transcript"></div>
+  </section>
+  <section>
+    <div class="head"><span>frames</span><button id="clearL">clear</button></div>
+    <div class="body" id="log"></div>
+  </section>
+</main>
+
+<footer>
+  <textarea id="text" placeholder="message — Enter to send, Shift+Enter for a newline"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button id="send" class="primary" disabled>send</button>
+    <button id="ping" disabled>ping</button>
+    <label>burst <input id="burst" type="number" value="6" min="1" max="50"></label>
+    <button id="sendBurst" disabled>send burst</button>
+  </div>
+  <div class="row probes">
+    <span class="lbl">probes:</span>
+    <button id="pBadJson" disabled>not json</button>
+    <button id="pUnknown" disabled>unknown type</button>
+    <button id="pExtra" disabled>extra field</button>
+    <button id="pEmpty" disabled>empty text</button>
+    <button id="pOversize" disabled>8001 chars</button>
+    <button id="pVersion" disabled>frame v=99</button>
+    <button id="pCap">connection cap</button>
+    <button id="pBadSession">bad session id</button>
+    <button id="pBadVersion">handshake v=99</button>
+  </div>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const CLOSE = {
+  1000: "normal — do not reconnect",
+  1001: "going away",
+  1005: "no close code",
+  1006: "abnormal — no close frame (a refused handshake looks like this)",
+  1008: "policy violation — terminal, surface to the user",
+  1011: "server error — reconnect with backoff",
+  1012: "service restart — reconnect immediately, jittered",
+  1013: "try again later — reconnect with backoff",
+};
+
+let ws = null;
+let autoSay = null;               // ?say=… , sent once the socket opens
+let pingTimer = null;
+let pingSentAt = 0;
+let seq = 0;                      // client_msg_id counter
+const turns = new Map();          // message_id -> {el, chunks, next, started}
+const pending = new Map();        // client_msg_id -> {el, at}
+
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
+
+function stamp() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+// True when the viewport's bottom edge is within `slack` px of the end of the
+// content. Callers measure this *before* inserting, since appending grows
+// scrollHeight and the answer is unrecoverable afterwards.
+const atBottom = (el, slack = 40) =>
+  el.scrollTop + el.clientHeight >= el.scrollHeight - slack;
+
+function log(dir, text, cls) {
+  const el = $("log");
+  const stick = atBottom(el, 30);
+  const row = document.createElement("div");
+  row.className = "l " + (cls || (dir === "→" ? "out" : dir === "←" ? "in" : "note"));
+  row.innerHTML = `<span class="t">${stamp()}</span><span class="d">${dir}</span><span>${
+    text.replace(/[<&]/g, c => c === "<" ? "&lt;" : "&amp;")}</span>`;
+  el.appendChild(row);
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function status(text, cls) {
+  $("status").textContent = text;
+  $("status").className = cls || "";
+}
+
+// `after` puts a reply next to the message it answers instead of at the end of
+// the list, which is the difference between a readable burst and six user
+// bubbles followed by six unattributed replies.
+function bubble(kind, who, text, after) {
+  const el = $("transcript");
+  const stick = atBottom(el);
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + kind;
+  wrap.innerHTML = `<div class="who"></div><div class="txt"></div><div class="meta"></div>`;
+  wrap.querySelector(".who").textContent = who;
+  wrap.querySelector(".txt").textContent = text || "";
+  if (after) after.after(wrap); else el.appendChild(wrap);
+  if (stick) el.scrollTop = el.scrollHeight;
+  return wrap;
+}
+
+function setLive(live) {
+  for (const id of ["send", "ping", "sendBurst", "pBadJson", "pUnknown", "pExtra",
+                    "pEmpty", "pOversize", "pVersion", "disconnect"]) $(id).disabled = !live;
+  $("connect").disabled = live;
+}
+
+// --- sending -------------------------------------------------------------
+
+function raw(payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log("!", "not connected"); return; }
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload);
+  ws.send(text);
+  log("→", text);
+}
+
+function sendMessage(text) {
+  const id = `c${++seq}`;
+  const el = bubble("u", `you · ${id}`, text);
+  pending.set(id, { el, at: performance.now() });
+  raw({ v: 1, type: "user_message", text, client_msg_id: id });
+}
+
+// --- receiving -----------------------------------------------------------
+
+function onFrame(data) {
+  log("←", data);
+  // Deltas grow a bubble that is already in the DOM, so the follow-the-tail
+  // decision has to be made around the whole handler, not per insertion.
+  const pane = $("transcript");
+  const stick = atBottom(pane);
+  try { handleFrame(data); } finally { if (stick) pane.scrollTop = pane.scrollHeight; }
+}
+
+function handleFrame(data) {
+  let f;
+  try { f = JSON.parse(data); } catch { log("!", "server sent non-json", "err"); return; }
+
+  if (f.type === "ack") {
+    const p = pending.get(f.client_msg_id);
+    if (p) {
+      p.el.querySelector(".meta").textContent =
+        `ack in ${Math.round(performance.now() - p.at)}ms → ${f.message_id}`;
+      pending.delete(f.client_msg_id);
+    } else {
+      log("!", `ack for unknown client_msg_id ${f.client_msg_id}`, "err");
+    }
+    const el = bubble("a", `assistant · ${f.message_id.slice(0, 8)}`, "", p && p.el);
+    turns.set(f.message_id, { el, chunks: 0, next: 0, started: performance.now() });
+    return;
+  }
+
+  if (f.type === "delta") {
+    const t = turns.get(f.message_id);
+    if (!t) { log("!", `delta for unknown message_id ${f.message_id}`, "err"); return; }
+    if (f.chunk_index !== t.next) {
+      log("!", `chunk_index ${f.chunk_index}, expected ${t.next}`, "err");
+    }
+    t.next = f.chunk_index + 1;
+    t.chunks++;
+    t.el.querySelector(".txt").textContent += f.text;
+    t.el.querySelector(".meta").textContent = `${t.chunks} chunks…`;
+    return;
+  }
+
+  if (f.type === "done") {
+    const t = turns.get(f.message_id);
+    if (!t) { log("!", `done for unknown message_id ${f.message_id}`, "err"); return; }
+    t.el.querySelector(".meta").textContent =
+      `${t.chunks} chunks in ${Math.round(performance.now() - t.started)}ms`;
+    turns.delete(f.message_id);
+    return;
+  }
+
+  if (f.type === "pong") {
+    const rtt = pingSentAt ? `${Math.round(performance.now() - pingSentAt)}ms` : "?";
+    log("!", `pong — rtt ${rtt}`);
+    pingSentAt = 0;
+    return;
+  }
+
+  if (f.type === "error") {
+    // Error frames carry no client_msg_id, so attribution is by order: the
+    // server reads messages sequentially and answers each over one queue, so an
+    // error belongs to the oldest send still unanswered. Without this the entry
+    // stays in `pending` until disconnect and its bubble keeps an empty meta
+    // line — visible by default now that a burst of 6 draws two rejections.
+    // Misattributes only if a probe that bypasses sendMessage (not json,
+    // frame v=99) is fired while a real message is unacked; the frame log is
+    // the source of truth there.
+    const [id, p] = pending.entries().next().value || [];
+    if (p) {
+      p.el.querySelector(".meta").textContent = `rejected · ${f.code}`;
+      pending.delete(id);
+    }
+    bubble("e", `error · ${f.code}`, f.message, p && p.el).querySelector(".meta").textContent =
+      f.retryable ? "retryable" : "not retryable";
+    return;
+  }
+
+  log("!", `unknown frame type ${f.type}`, "err");
+}
+
+// --- connection ----------------------------------------------------------
+
+function socketUrl(session, version) {
+  const base = $("url").value.replace(/\/+$/, "");
+  const v = version === undefined ? $("ver").value.trim() : version;
+  return `${base}/ws/chat/${session}` + (v ? `?v=${encodeURIComponent(v)}` : "");
+}
+
+function connect() {
+  const url = socketUrl($("session").value.trim());
+  status(`connecting — ${url}`);
+  log("!", `connect ${url}`);
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    status(`open — ${url}`);
+    log("!", "open");
+    setLive(true);
+    if ($("autoping").checked) pingTimer = setInterval(() => ping(), 20000);
+    if (autoSay !== null) { sendMessage(autoSay); autoSay = null; }
+  };
+  ws.onmessage = e => onFrame(e.data);
+  ws.onerror = () => log("!", "socket error (a refused handshake reaches JS only as this + 1006)", "err");
+  ws.onclose = e => {
+    clearInterval(pingTimer); pingTimer = null;
+    const why = CLOSE[e.code] || "unmapped";
+    status(`closed ${e.code} — ${why}${e.reason ? ` — ${e.reason}` : ""}`, e.code === 1000 ? "" : "err");
+    log("!", `close ${e.code} (${why})${e.reason ? ` reason=${e.reason}` : ""}`, e.code === 1000 ? "" : "err");
+    setLive(false);
+    ws = null;
+    for (const t of turns.values()) {
+      t.el.querySelector(".meta").textContent += " — socket closed mid-turn";
+    }
+    turns.clear(); pending.clear();
+  };
+}
+
+function ping() {
+  pingSentAt = performance.now();
+  raw({ v: 1, type: "ping" });
+}
+
+// --- probes --------------------------------------------------------------
+
+// Opens sockets on the *current* session until the server refuses one, which is
+// how ws_max_connections_per_session shows up from a browser: an error frame
+// with too_many_connections, then a 1013 close.
+function probeCap() {
+  const session = $("session").value.trim();
+  const extras = [];
+  let done = false;
+  log("!", "probing connection cap on this session");
+
+  const finish = (msg, cls) => {
+    if (done) return;
+    done = true;
+    log("!", msg, cls);
+    for (const s of extras) { try { s.close(1000); } catch {} }
+    log("!", `${extras.length} probe socket(s) closed`);
+  };
+
+  const openOne = () => {
+    if (done) return;
+    if (extras.length >= 16) { finish("stopped at 16 sockets without hitting a cap", "err"); return; }
+
+    const s = new WebSocket(socketUrl(session));
+    const n = extras.push(s);
+    let refused = false;
+
+    s.onmessage = e => {
+      log("←", `[probe ${n}] ${e.data}`);
+      try { refused = JSON.parse(e.data).code === "too_many_connections"; } catch {}
+    };
+    s.onclose = e => {
+      if (refused || e.code === 1013) {
+        finish(`cap reached: ${n - 1} probe socket(s) held alongside this page's, ` +
+               `the next was refused and closed ${e.code}`);
+      }
+    };
+    // A refusal is an accepted handshake followed by an error frame and a close,
+    // so it arrives *after* onopen. Opening the next socket immediately would
+    // race past the refusal and inflate the count; give this one a beat first.
+    s.onopen = () => setTimeout(() => { if (!refused) openOne(); }, 150);
+  };
+  openOne();
+}
+
+// A handshake the server must refuse before accept(). The ASGI server turns
+// close-before-accept into an HTTP 403, so the browser only ever sees 1006 —
+// the server log is where the actual reason is.
+function probeHandshake(what, url) {
+  log("!", `handshake probe: ${what} — ${url}`);
+  const s = new WebSocket(url);
+  s.onopen = () => { log("!", `${what}: ACCEPTED — expected a refusal`, "err"); s.close(1000); };
+  s.onclose = e => log("!", `${what}: closed ${e.code} (${CLOSE[e.code] || "unmapped"})`);
+}
+
+// --- wiring --------------------------------------------------------------
+
+// Query params so a run is reproducible and scriptable:
+//   ?server=ws://localhost:8765&session=<uuid>&v=1&go=1&say=hello
+// `go` connects on load and `say` sends once open, which is what makes this
+// usable as a headless smoke check and not only as a hand-driven page.
+const params = new URLSearchParams(location.search);
+if (params.get("server")) $("url").value = params.get("server");
+if (params.get("v")) $("ver").value = params.get("v");
+$("session").value = params.get("session") || uuid();
+$("newSession").onclick = () => { $("session").value = uuid(); };
+$("connect").onclick = connect;
+$("disconnect").onclick = () => ws && ws.close(1000, "client done");
+$("clearT").onclick = () => { $("transcript").innerHTML = ""; };
+$("clearL").onclick = () => { $("log").innerHTML = ""; };
+
+$("send").onclick = () => {
+  const t = $("text").value.trim();
+  if (t) { sendMessage(t); $("text").value = ""; }
+};
+$("text").onkeydown = e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send").click(); }
+};
+$("ping").onclick = ping;
+
+// Several turns at once: the interesting part is that deltas from different
+// message_ids interleave on the wire and each turn still assembles in order.
+//
+// The default burst of 6 is over ws_max_concurrent_turns (4) on purpose, so two
+// messages come back as too_many_turns — the cap being visible, not a failure.
+// Neither this nor the interleaving could be seen here until turns began
+// yielding between deltas: before that a turn ran to completion without ever
+// handing back the event loop, so a burst was answered strictly one at a time.
+$("sendBurst").onclick = () => {
+  const n = Math.max(1, Math.min(50, +$("burst").value || 1));
+  for (let i = 1; i <= n; i++) sendMessage(`burst ${i} of ${n}`);
+};
+
+$("pBadJson").onclick  = () => raw("{not json");
+$("pUnknown").onclick  = () => raw({ v: 1, type: "cancel", message_id: "x" });
+$("pExtra").onclick    = () => raw({ v: 1, type: "ping", nonsense: true });
+$("pEmpty").onclick    = () => raw({ v: 1, type: "user_message", text: "", client_msg_id: `c${++seq}` });
+$("pOversize").onclick = () => raw({ v: 1, type: "user_message", text: "x".repeat(8001), client_msg_id: `c${++seq}` });
+$("pVersion").onclick  = () => raw({ v: 99, type: "ping" });
+$("pCap").onclick      = probeCap;
+$("pBadSession").onclick = () => probeHandshake("bad session id", socketUrl("not-a-uuid", ""));
+$("pBadVersion").onclick = () => probeHandshake("handshake v=99", socketUrl($("session").value.trim(), "99"));
+
+if (params.has("say")) autoSay = params.get("say");
+if (params.has("go")) connect();
+else status("idle — set the server, then connect");
+</script>
+</body>
+</html>

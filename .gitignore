@@ -9,6 +9,7 @@ __pycache__/
 .env.*
 !.env.example
 .DS_Store
+*.swp
 *.egg-info/
 dist/
 build/
