@@ -3,7 +3,7 @@ SHELL := /bin/bash
 
 VENV := .venv
 
-.PHONY: help install lock lint fmt test up down logs rebuild verify chat clean
+.PHONY: help install lock lint fmt test migrate migration up down logs rebuild verify chat clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -27,6 +27,20 @@ fmt: ## Format
 
 test: ## Run tests (no containers required)
 	uv run pytest
+
+# Migrations are a deliberate step, never the api container's entrypoint: with
+# more than one replica every pod would race to migrate the same database on
+# every rollout. Run this once, then roll the pods.
+#
+# Reads DATABASE_URL like everything else. From the host that means .env — the
+# built-in default points at `postgres:5432`, which only resolves inside the
+# compose network. `cp .env.example .env` is the fix.
+migrate: ## Apply migrations up to head
+	uv run alembic upgrade head
+
+migration: ## Autogenerate a revision: make migration m="add chat tables"
+	@test -n "$(m)" || { echo 'usage: make migration m="what changed"'; exit 1; }
+	uv run alembic revision --autogenerate -m "$(m)"
 
 up: ## Start the stack
 	docker compose up -d --build

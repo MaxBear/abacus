@@ -1,0 +1,46 @@
+Single-database configuration with an async dbapi.
+
+## How this directory was generated
+
+    uv run alembic init --template async alembic
+
+Once, at setup. It created this directory (`env.py`, `script.py.mako`, `README`,
+`versions/`) and `alembic.ini` at the repo root. `alembic init` refuses to run
+against an existing directory, so it is not a command to repeat — the files below
+are edited by hand from here on.
+
+`--template async` is the part that matters: it is why `env.py` came with
+`async_engine_from_config` and `asyncio.run(run_async_migrations())` rather than
+the synchronous `generic` shape. Switching later means rewriting `env.py`.
+
+## What was changed from the stock template
+
+- **`sqlalchemy.url` deleted from `alembic.ini`.** `env.py` sets it from
+  `Settings` instead. Credentials in a committed ini is the failure this avoids,
+  and it means migrations and the app cannot disagree about which database they
+  are pointed at.
+- **`file_template` uncommented**, minus the underscores the stock version puts
+  between year, month, and day: `20260817_1643-…` rather than `2026_08_17_1643-…`.
+  Same sort order, reads as a date.
+- **`post_write_hooks` enabled** for `ruff check --fix` and `ruff format`, so a
+  generated revision is formatted like the rest of the codebase. The executable
+  is bare `ruff`, resolved from `PATH` — which is why these commands are run
+  through `uv run`, and why invoking `alembic` outside it may skip the hooks.
+
+## Day to day
+
+    make migration m="what changed"   # autogenerate a revision
+    make migrate                      # apply up to head
+
+Both read `DATABASE_URL` like everything else. From the host that means `.env`;
+the built-in default points at `postgres:5432`, which only resolves inside the
+compose network.
+
+Autogenerate is a diff against a *live* database, so apply existing migrations
+before generating a new one. It is also not authoritative — hence the
+`please adjust!` markers in every generated file. The gap on this project's path:
+**Alembic does not detect CHECK constraint changes on an existing table.** The
+`role` and `status` checks in `adapters/tables.py` landed only because they were
+part of a `create_table`. Widening one later produces an empty `upgrade()`, and
+the `op.drop_constraint` / `op.create_check_constraint` pair has to be written by
+hand. Treat an empty `upgrade()` as suspicious, never as "no changes".
