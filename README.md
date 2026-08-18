@@ -38,7 +38,8 @@ make up          # build + start api, postgres, rabbitmq
 curl localhost:8000/livez      # {"status":"ok"}
 curl localhost:8000/readyz     # {"status":"ready", ...}
 make verify      # Phase 0 acceptance checks
-make down
+make down        # stop, keeping the database
+make reset       # stop and destroy the database
 ```
 
 Local test run needs no containers. Requires [uv](https://docs.astral.sh/uv/)

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 
 VENV := .venv
 
-.PHONY: help install lock lint fmt test migrate migration up down logs rebuild verify chat clean
+.PHONY: help install lock lint fmt test migrate migration up down reset logs rebuild verify chat clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -45,7 +45,13 @@ migration: ## Autogenerate a revision: make migration m="add chat tables"
 up: ## Start the stack
 	docker compose up -d --build
 
-down: ## Stop the stack and drop volumes
+# Keeps the pgdata volume. Since 1b the database holds the chat log and the
+# alembic_version row, so dropping it on every stop would mean re-migrating
+# before the app works again — and losing the state persistence exists to keep.
+down: ## Stop the stack, keeping data
+	docker compose down
+
+reset: ## Stop the stack and destroy the database
 	docker compose down -v
 
 logs: ## Tail api logs
