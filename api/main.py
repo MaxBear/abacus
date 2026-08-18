@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from adapters import db
-from adapters.chat_repository import PostgresChatRepository
+from adapters.postgres import db
+from adapters.postgres.chat_repository import PostgresChatRepository
 from api import chat, health
 from core.config import get_settings
 from core.protocol import Error, ErrorCode

@@ -1,7 +1,7 @@
 """The Postgres implementation of `core.repository.ChatRepository`.
 
 Infrastructure, so it lives here rather than in `core/`: the Protocol is domain,
-the SQL is not. This is what `adapters/db.py`'s `session()` has been waiting
+the SQL is not. This is what `adapters/postgres/db.py`'s `session()` has been waiting
 for since phase 0.
 
 Every method is one transaction, opened and closed inside the method. The
@@ -9,7 +9,7 @@ Every method is one transaction, opened and closed inside the method. The
 a transaction open would be able to stall every other turn on that session
 behind an LLM call.
 
-Written with SQLAlchemy Core against `adapters/tables.py`, not the ORM: these
+Written with SQLAlchemy Core against `adapters/postgres/tables.py`, not the ORM: these
 are five statements with no object graph, no identity map, and no lazy loads to
 want.
 """
@@ -20,8 +20,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from adapters.db import Database
-from adapters.tables import chat_messages, chat_sessions
+from adapters.postgres.db import Database
+from adapters.postgres.tables import chat_messages, chat_sessions
 from core.repository import RecordedUserMessage, Role, Status, StoredMessage
 
 # The columns a StoredMessage is built from, in one place so the select list and
@@ -48,7 +48,7 @@ def _to_message(row) -> StoredMessage:
 
 
 class PostgresChatRepository:
-    """`ChatRepository` over the tables in `adapters/tables.py`."""
+    """`ChatRepository` over the tables in `adapters/postgres/tables.py`."""
 
     def __init__(self, db: Database) -> None:
         self._db = db

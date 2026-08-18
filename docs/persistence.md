@@ -173,7 +173,7 @@ rejected as `bad_frame` — deliberately, per the PR that landed 1a.
    the only one that survives more than one replica.
 2. **The tables above**, as that first revision.
 3. **A repository behind a Protocol in `core/`**, implemented in `adapters/`. This is what
-   `adapters/db.py:37`'s `session()` has been waiting for. The Protocol is what lets the tests keep
+   `adapters/postgres/db.py:37`'s `session()` has been waiting for. The Protocol is what lets the tests keep
    running without containers, via `dependency_overrides` — the same seam `Responder` uses.
 4. **`seq` on `ack` and `done`**, and the persistence calls in `ConnectionHandler`.
 5. **`client_msg_id` idempotency** on the insert path.

@@ -21,9 +21,9 @@ import uuid
 import pytest
 from sqlalchemy import delete, text
 
-from adapters.chat_repository import PostgresChatRepository
-from adapters.db import Database
-from adapters.tables import chat_sessions
+from adapters.postgres.chat_repository import PostgresChatRepository
+from adapters.postgres.db import Database
+from adapters.postgres.tables import chat_sessions
 from core.config import get_settings
 from core.repository import Role, Status
 from tests.fakes import FakeChatRepository

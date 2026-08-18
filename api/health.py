@@ -3,7 +3,7 @@ import logging
 
 from fastapi import APIRouter, Response, status
 
-from adapters import broker
+from adapters.rabbitmq import broker
 from api.deps import DatabaseDep, SettingsDep
 
 log = logging.getLogger(__name__)

@@ -5,7 +5,7 @@ in a committed ini file is the failure this avoids; it also means migrations and
 the app cannot disagree about which database they are pointed at, since both
 resolve `DATABASE_URL` the same way.
 
-`adapters/db.py` anticipates this: its `Database` is constructed from settings by
+`adapters/postgres/db.py` anticipates this: its `Database` is constructed from settings by
 whoever needs it, "so a worker or an Alembic env can build its own instance
 without the API being involved". This env builds its own engine for the same
 reason — importing `api.main` here would drag the whole ASGI app, its lifespan,
@@ -19,7 +19,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from adapters.tables import metadata
+from adapters.postgres.tables import metadata
 from alembic import context
 from core.config import get_settings
 

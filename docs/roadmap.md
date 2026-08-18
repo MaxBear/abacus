@@ -60,7 +60,7 @@ connection lifecycle with heartbeat, an in-memory session registry, and a stream
 behind a Protocol. Messages do not survive the connection.
 
 **1b — persistence.** Alembic bootstrap, `chat_sessions` / `chat_messages`, `seq` allocation,
-`resume` on reconnect, `client_msg_id` idempotency. This is what `adapters/db.py:37` is waiting for:
+`resume` on reconnect, `client_msg_id` idempotency. This is what `adapters/postgres/db.py:37` is waiting for:
 *"Nothing calls this until phase 1 adds real queries."*
 
 **Acceptance.** Handshake, authorization rejection, frame round-trips, and the close-code contract
