@@ -13,6 +13,7 @@ from starlette.requests import HTTPConnection
 
 from adapters.db import Database
 from core.config import Settings
+from core.repository import ChatRepository
 from core.responder import Responder
 from core.ws import ConnectionRegistry
 
@@ -41,7 +42,12 @@ async def get_responder(conn: HTTPConnection) -> Responder:
     return conn.app.state.responder
 
 
+async def get_chat_repository(conn: HTTPConnection) -> ChatRepository:
+    return conn.app.state.chat_repository
+
+
 DatabaseDep = Annotated[Database, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 RegistryDep = Annotated[ConnectionRegistry, Depends(get_registry)]
 ResponderDep = Annotated[Responder, Depends(get_responder)]
+ChatRepositoryDep = Annotated[ChatRepository, Depends(get_chat_repository)]

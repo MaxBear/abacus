@@ -9,6 +9,8 @@ Alembic's `env.py` imports `metadata` from here and nothing else, so autogenerat
 sees the schema without importing the API.
 """
 
+from enum import StrEnum
+
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -26,6 +28,8 @@ from sqlalchemy import (
     text,
 )
 
+from core.repository import Role, Status
+
 # Explicit constraint naming, set before any table is defined.
 #
 # Without this Postgres invents names, and they are only mostly predictable — an
@@ -42,6 +46,11 @@ NAMING_CONVENTION = {
 }
 
 metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+def _quoted(values: type[StrEnum]) -> str:
+    """`'a', 'b'` — a SQL literal list, for an `in (...)` check constraint."""
+    return ", ".join(f"'{v}'" for v in values)
 
 
 chat_sessions = Table(
@@ -90,14 +99,20 @@ chat_messages = Table(
     Column("completed_at", DateTime(timezone=True)),
     # Text plus a check rather than a Postgres enum: adding a state later is then
     # a constraint change instead of a type migration.
-    CheckConstraint("role in ('user', 'assistant')", name="role"),
-    CheckConstraint("status in ('streaming', 'complete', 'failed')", name="status"),
+    #
+    # Spelled from core.repository's enums so there is one list, not two. Note
+    # what this does *not* buy: alembic autogenerate cannot see a CHECK
+    # constraint change, so editing an enum still produces an empty migration
+    # and the database keeps rejecting the new value until someone hand-writes
+    # the drop/create. See alembic/README.
+    CheckConstraint(f"role in ({_quoted(Role)})", name="role"),
+    CheckConstraint(f"status in ({_quoted(Status)})", name="status"),
     # Ties the idempotency key to the role in both directions. Without it the
     # partial unique index below silently permits an assistant row to carry a
     # client's key, and a user row to carry none — which would make the re-ack
     # path unreachable for that message.
     CheckConstraint(
-        "(role = 'user') = (client_msg_id is not null)",
+        f"(role = '{Role.USER}') = (client_msg_id is not null)",
         name="client_msg_id_matches_role",
     ),
     # Enforces gap-free allocation at the database rather than trusting the
