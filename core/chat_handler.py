@@ -1,6 +1,6 @@
 """The chat protocol driven over one connection.
 
-Sits between `core/protocol.py`, which defines what a frame *is*, and
+Sits between `core/frames.py`, which defines what a frame *is*, and
 `core/ws.py`, which knows how to move bytes and nothing about their meaning.
 Everything here is the part in the middle: which frame gets which reply, when a
 turn may start, and how the two sides are shut down together.
@@ -12,13 +12,14 @@ The design and its reasoning live in docs/websocket.md.
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
 
 from pydantic import ValidationError
 
 from core.config import Settings
-from core.protocol import (
+from core.frames import (
     CLIENT_FRAME_ADAPTER,
     PROTOCOL_VERSION,
     Ack,
@@ -28,7 +29,9 @@ from core.protocol import (
     ErrorCode,
     Ping,
     Pong,
+    UserMessage,
 )
+from core.repository import ChatRepository, StoredMessage
 from core.responder import Responder
 from core.ws import WS_INTERNAL_ERROR, WS_NORMAL, Connection
 
@@ -43,14 +46,40 @@ class ConnectionHandler:
     across reconnects.
     """
 
-    def __init__(self, conn: Connection, responder: Responder, settings: Settings) -> None:
+    def __init__(
+        self,
+        conn: Connection,
+        repository: ChatRepository,
+        responder: Responder,
+        settings: Settings,
+    ) -> None:
         self._conn = conn
+        self._repo = repository
         self._responder = responder
         self._settings = settings
         self._turns: set[asyncio.Task] = set()
+        # client_msg_id -> the assistant row a turn on *this* connection is
+        # streaming into, so a resubmitted message can be re-acked with the
+        # stream it already has. Bounded by ws_max_concurrent_turns: an entry is
+        # evicted the moment its turn ends, which is also what keeps it honest —
+        # it never names a stream that is no longer running.
+        self._live_replies: dict[str, uuid.UUID] = {}
 
     async def serve(self) -> None:
         """Run the reader and the writer until either stops, then close once."""
+        try:
+            # Before either task starts: every message stored below allocates
+            # its seq from this row, so a turn that ran ahead of it would fail
+            # on a foreign key rather than on anything legible.
+            await self._repo.ensure_session(self._conn.session_id)
+        except Exception:
+            log.exception("could not open session (session=%s)", self._conn.session_id)
+            # No writer task yet, so an error frame would only sit in the queue
+            # unread. 1011 is the code that tells the client to reconnect with
+            # backoff, which is the right answer to a database that is down.
+            await self._conn.close(WS_INTERNAL_ERROR)
+            return
+
         writer = asyncio.create_task(self._conn.run_writer(), name="ws-writer")
         reader = asyncio.create_task(self._read_frames(), name="ws-reader")
 
@@ -98,13 +127,13 @@ class ConnectionHandler:
         """
         try:
             async for raw in self._conn:
-                self._dispatch(raw)
+                await self._dispatch(raw)
         finally:
             for task in self._turns:
                 task.cancel()
             await asyncio.gather(*self._turns, return_exceptions=True)
 
-    def _dispatch(self, raw: str) -> None:
+    async def _dispatch(self, raw: str) -> None:
         try:
             frame = CLIENT_FRAME_ADAPTER.validate_json(raw)
         except ValidationError as exc:
@@ -144,20 +173,87 @@ class ConnectionHandler:
             )
             return
 
-        message_id = uuid.uuid4().hex
-        self._conn.send(Ack(client_msg_id=frame.client_msg_id, message_id=message_id))
+        try:
+            await self._start_turn(frame)
+        except Exception:  # noqa: BLE001 - a database blip must not kill the socket
+            # A message that could not be stored was not accepted, and saying so
+            # is the whole point of `ack` meaning durable. Retryable, because the
+            # client resends under the same client_msg_id and the idempotency
+            # key makes that safe however far the first attempt got.
+            log.exception("could not record message (session=%s)", self._conn.session_id)
+            self._conn.send(
+                Error(
+                    code=ErrorCode.INTERNAL,
+                    message="the message was not stored",
+                    retryable=True,
+                )
+            )
 
-        task = asyncio.create_task(self._run_turn(frame.text, message_id))
+    async def _start_turn(self, frame: UserMessage) -> None:
+        """Store the message, open a reply, ack both, and spawn the turn.
+
+        Both writes happen inline, before the turn is spawned, so `seq` follows
+        the order messages were sent and the two rows of a turn stay adjacent.
+        They are allowed on the read loop because they are two single statements
+        behind one row lock; the thing that may not sit here is the reply.
+        """
+        recorded = await self._repo.record_user_message(
+            self._conn.session_id, frame.client_msg_id, frame.text
+        )
+
+        if recorded.created:
+            # Opened before the ack rather than inside the turn: the ack names
+            # the stream, so the row it names has to exist first.
+            assistant = await self._repo.start_assistant_message(self._conn.session_id)
+            self._live_replies[frame.client_msg_id] = assistant.message_id
+            reply_id = assistant.message_id
+        else:
+            # The key was already stored, so this is a replay, not a second
+            # question: re-ack the row that exists and start nothing. The stream
+            # is named only if that turn is still running here — a replay after
+            # a reconnect reaches a handler that never started it, and its turn
+            # died with the socket that did.
+            assistant = None
+            reply_id = self._live_replies.get(frame.client_msg_id)
+
+        # One ack for both paths. Only the named stream differs; the other three
+        # fields describe the stored user message, which is the same row either
+        # way — and this frame gains fields as the protocol version grows.
+        self._conn.send(
+            Ack(
+                client_msg_id=frame.client_msg_id,
+                seq=recorded.message.seq,
+                message_id=recorded.message.message_id.hex,
+                reply_message_id=reply_id.hex if reply_id is not None else None,
+            )
+        )
+
+        if assistant is None:  # a replay: the ack was the whole of the answer
+            return
+
+        task = asyncio.create_task(self._run_turn(frame.text, assistant))
         self._turns.add(task)
+
+        def _finished(task: asyncio.Task) -> None:
+            self._turns.discard(task)
+            # Evicted only now, so the entry never outlives the stream it names.
+            # _run_turn has already written the row's terminal state by here, so
+            # a replay that misses the map finds a resolved row instead — which
+            # is the answer resume gives it.
+            self._live_replies.pop(frame.client_msg_id, None)
+
         # Strong reference until completion: a bare create_task can be garbage
         # collected mid-flight, which loses the turn with no error anywhere.
-        task.add_done_callback(self._turns.discard)
+        task.add_done_callback(_finished)
 
-    async def _run_turn(self, text: str, message_id: str) -> None:
+    async def _run_turn(self, text: str, assistant: StoredMessage) -> None:
+        message_id = assistant.message_id
+        chunks: list[str] = []
         try:
             index = 0
             async for chunk in self._responder.respond(text):
-                self._conn.send(Delta(message_id=message_id, chunk_index=index, text=chunk))
+                chunks.append(chunk)
+                self._conn.send(Delta(message_id=message_id.hex, chunk_index=index, text=chunk))
                 index += 1
                 # Hand the loop to the writer between frames. A responder that
                 # never awaits — the stub, and any future one that yields from a
@@ -166,13 +262,39 @@ class ConnectionHandler:
                 # that drains it never gets scheduled. The bound is there to drop
                 # a slow reader, not a long reply.
                 await asyncio.sleep(0)
-            self._conn.send(Done(message_id=message_id))
+
+            # Written before `done` is queued, not after: the frame says the text
+            # is final, and a client that reconnects on the strength of it has to
+            # find that text in the log rather than an empty streaming row.
+            await self._repo.complete_assistant_message(message_id, "".join(chunks))
+            self._conn.send(Done(message_id=message_id.hex, seq=assistant.seq))
         except asyncio.CancelledError:
+            # The socket is going away and this turn dies with it. Shielded so
+            # the row still reaches a terminal state: left at `streaming` it is
+            # indistinguishable, to the next connection, from one still in
+            # flight. Best effort only: if a second cancellation arrives before
+            # this write lands, the row stays `streaming`, and closing that gap
+            # needs a sweep at resume time rather than anything available here.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(self._mark_failed(message_id))
             raise
         except Exception:  # noqa: BLE001 - one failed turn must not kill the socket
             log.exception(
                 "turn failed (session=%s message_id=%s)", self._conn.session_id, message_id
             )
+            await self._mark_failed(message_id)
             self._conn.send(
                 Error(code=ErrorCode.INTERNAL, message="the turn failed", retryable=True)
             )
+
+    async def _mark_failed(self, message_id: uuid.UUID) -> None:
+        """Mark a turn failed without letting that write become the failure.
+
+        The caller is already handling something that went wrong; a database
+        error raised from here would replace it, and would escape a task nobody
+        awaits — which asyncio reports, much later, as an unretrieved exception.
+        """
+        try:
+            await self._repo.fail_assistant_message(message_id)
+        except Exception:  # noqa: BLE001 - see above
+            log.exception("could not mark message failed (message_id=%s)", message_id)

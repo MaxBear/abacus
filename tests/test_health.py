@@ -8,7 +8,7 @@ from core.config import Settings
 
 
 class FakeDatabase:
-    """Stands in for adapters.db.Database.
+    """Stands in for adapters.postgres.db.Database.
 
     Injected through dependency_overrides rather than monkeypatching an import
     path by string, which is the point of constructing Database in lifespan and
@@ -55,7 +55,7 @@ async def test_livez_has_no_dependencies(client, monkeypatch):
         raise ConnectionError("rabbitmq is down")
 
     app.dependency_overrides[deps.get_db] = lambda: FakeDatabase(healthy=False)
-    monkeypatch.setattr("adapters.broker.ping", boom)
+    monkeypatch.setattr("adapters.rabbitmq.broker.ping", boom)
 
     resp = await client.get("/livez")
     assert resp.status_code == 200
@@ -67,7 +67,7 @@ async def test_readyz_reports_503_when_a_dependency_is_down(client, monkeypatch)
         return None
 
     app.dependency_overrides[deps.get_db] = lambda: FakeDatabase(healthy=False)
-    monkeypatch.setattr("adapters.broker.ping", fine)
+    monkeypatch.setattr("adapters.rabbitmq.broker.ping", fine)
 
     resp = await client.get("/readyz")
     assert resp.status_code == 503
@@ -81,7 +81,7 @@ async def test_readyz_ok_when_all_dependencies_are_up(client, monkeypatch):
     async def fine(*_args) -> None:
         return None
 
-    monkeypatch.setattr("adapters.broker.ping", fine)
+    monkeypatch.setattr("adapters.rabbitmq.broker.ping", fine)
 
     resp = await client.get("/readyz")
     assert resp.status_code == 200
@@ -96,7 +96,7 @@ async def test_readyz_uses_the_injected_database(client, monkeypatch):
     async def fine(*_args) -> None:
         return None
 
-    monkeypatch.setattr("adapters.broker.ping", fine)
+    monkeypatch.setattr("adapters.rabbitmq.broker.ping", fine)
 
     resp = await client.get("/readyz")
     assert resp.status_code == 200

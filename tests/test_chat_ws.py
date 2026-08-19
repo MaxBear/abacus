@@ -1,7 +1,7 @@
 """Phase 1a acceptance: the frame protocol, and the transport rules around it.
 
 No containers and no LLM — the responder is a stub behind the Protocol phase 4
-will implement, and the connection plumbing is exercised directly with a fake
+will implement, and the connection plumbing is exercised directly with a mock
 socket where a real one would only add nondeterminism.
 """
 
@@ -19,7 +19,8 @@ from api import deps
 from api.main import app
 from core.chat_handler import ConnectionHandler
 from core.config import Settings
-from core.protocol import PROTOCOL_VERSION, Error, ErrorCode, Pong
+from core.frames import PROTOCOL_VERSION, Error, ErrorCode, Pong
+from core.repository import Role, Status
 from core.responder import StubResponder
 from core.ws import (
     WS_NORMAL,
@@ -28,19 +29,31 @@ from core.ws import (
     Connection,
     ConnectionRegistry,
 )
+from tests.MockChatRepository import MockChatRepository
 
 SESSION = str(uuid.uuid4())
 URL = f"/ws/chat/{SESSION}"
 
 
 @pytest.fixture
-def client():
+def repository():
+    """The mock behind the route, also readable by a test that asserts on rows."""
+    return MockChatRepository()
+
+
+@pytest.fixture
+def client(repository):
     """A client whose lifespan has actually run.
 
     Unlike the health tests' ASGITransport, this needs app.state populated: the
     registry and the responder are built in lifespan, and the point of building
     them there is that the socket route finds them without importing anything.
+
+    The repository is a mock, and a *fresh* one per test: these tests share one
+    SESSION and reuse `client_msg_id` "c1", so a repository that outlived a test
+    would answer the next one's first message as a duplicate.
     """
+    app.dependency_overrides[deps.get_chat_repository] = lambda: repository
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -59,7 +72,14 @@ def test_a_user_message_streams_ack_then_deltas_then_done(client):
         assert ack["type"] == "ack"
         assert ack["client_msg_id"] == "c1"
         assert ack["v"] == PROTOCOL_VERSION
-        message_id = ack["message_id"]
+        # The first message in a fresh session, so its row is seq 1 and the
+        # reply it opens is seq 2.
+        assert ack["seq"] == 1
+        # Two rows, two identities: the ack names the user's message, the
+        # stream names the assistant's. Binding deltas to ack["message_id"]
+        # would match nothing.
+        assert ack["reply_message_id"] != ack["message_id"]
+        message_id = ack["reply_message_id"]
 
         deltas = []
         while (frame := ws.receive_json())["type"] != "done":
@@ -68,6 +88,7 @@ def test_a_user_message_streams_ack_then_deltas_then_done(client):
             deltas.append(frame)
 
         assert frame["message_id"] == message_id
+        assert frame["seq"] == 2
         # Several chunks, not one: the multi-frame streaming path is the thing
         # the stub exists to exercise before there is a model behind it.
         assert len(deltas) > 1
@@ -96,6 +117,92 @@ def test_a_reply_longer_than_the_send_queue_still_arrives(client):
 
     assert [d["chunk_index"] for d in deltas] == list(range(len(deltas)))
     assert "".join(d["text"] for d in deltas) == f"echo: {text} "
+
+
+def test_a_resubmitted_message_is_re_acked_without_a_second_turn(client):
+    """A client unsure its message landed resends it under the same key.
+
+    The answer must be the row that already exists — same `seq`, same
+    `message_id` — and no second turn, or every uncertain reconnect silently
+    doubles the user's question. Here the first turn has already finished, so
+    its entry in the live map is gone and there is no stream to name: the reply
+    is a completed row, which is resume's job to hand back rather than the
+    ack's.
+    """
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        first = ws.receive_json()
+        while ws.receive_json()["type"] != "done":
+            pass
+
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        again = ws.receive_json()
+
+        # No second turn: a ping is answered immediately, with no deltas ahead
+        # of the pong.
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+    assert again["type"] == "ack"
+    assert again["seq"] == first["seq"]
+    assert again["message_id"] == first["message_id"]
+    assert again["reply_message_id"] is None
+
+
+def test_a_resubmit_while_the_turn_is_live_is_re_acked_with_the_same_stream(client):
+    """The other half: the original turn is still running on this connection.
+
+    There *is* a stream to name, and it must be the one already in flight — a
+    client that reconnected its bubble to a new id would then never see the
+    deltas it is about to receive.
+    """
+
+    class SlowResponder:
+        async def respond(self, text: str):
+            await asyncio.sleep(30)
+            yield text  # pragma: no cover - the test never lets it get here
+
+    app.dependency_overrides[deps.get_responder] = SlowResponder
+
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        first = ws.receive_json()
+
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        again = ws.receive_json()
+
+    assert again["seq"] == first["seq"]
+    assert again["reply_message_id"] == first["reply_message_id"]
+
+
+def test_a_turn_that_raises_leaves_the_row_failed_not_streaming(client, repository):
+    """An error frame is not enough — the row has to reach a terminal state.
+
+    Left at `streaming`, the reply is indistinguishable on the next connection
+    from one still in flight, and the client renders a half-sentence under a
+    spinner that never resolves.
+    """
+
+    class FailingResponder:
+        async def respond(self, text: str):
+            raise RuntimeError("boom")
+            yield ""  # pragma: no cover - makes this an async generator
+
+    app.dependency_overrides[deps.get_responder] = FailingResponder
+
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        assert ws.receive_json()["type"] == "ack"
+
+        err = ws.receive_json()
+        assert err["code"] == ErrorCode.INTERNAL
+        assert err["retryable"] is True
+
+    rows = asyncio.run(repository.messages_since(uuid.UUID(SESSION), 0, 10))
+    assert [(r.role, r.status) for r in rows] == [
+        (Role.USER, Status.COMPLETE),
+        (Role.ASSISTANT, Status.FAILED),
+    ]
 
 
 def test_ping_is_answered_with_pong(client):
@@ -214,11 +321,13 @@ def test_a_non_uuid_session_id_is_refused(client):
     ids=["uppercase", "undashed", "braced", "urn"],
 )
 def test_a_non_canonical_uuid_spelling_is_refused(client, spelling):
-    """uuid.UUID() parses all of these, but they are not the same registry key.
+    """uuid.UUID() parses all of these; the server still refuses them.
 
-    The path string is what the registry buckets connections by, so admitting a
-    second spelling of one session would silently fan a message out to only the
-    clients that happened to spell it the same way.
+    Policy, not correctness: the registry keys on the parsed UUID, so every
+    spelling already lands in one bucket and the per-session cap holds either
+    way. What the check buys is that one session never appears under five
+    different URLs in the logs — and that a client sending a spelling the server
+    never mints hears about it, rather than being quietly accommodated.
     """
     with pytest.raises(WebSocketDisconnect), client.websocket_connect(f"/ws/chat/{spelling}"):
         pass
@@ -262,9 +371,10 @@ def test_connections_per_session_are_capped(client):
 def test_concurrent_turns_are_capped(client):
     """The second message is dispatched strictly after the first is registered.
 
-    `_dispatch` adds the turn to the set synchronously before returning to the
-    read loop, so this needs no sleep on the test side to be deterministic — only
-    a responder slow enough that the first turn has not finished.
+    The read loop awaits `_dispatch` to completion before pulling the next
+    frame, and `_dispatch` adds the turn to the set before it returns, so this
+    needs no sleep on the test side to be deterministic — only a responder slow
+    enough that the first turn has not finished.
     """
 
     class SlowResponder:
@@ -286,11 +396,11 @@ def test_concurrent_turns_are_capped(client):
 
 
 # --------------------------------------------------------------------------
-# Connection plumbing, against a fake socket
+# Connection plumbing, against a mock socket
 # --------------------------------------------------------------------------
 
 
-class FakeWebSocket:
+class MockWebSocket:
     """Records what reached the wire. A real socket would only add scheduling noise."""
 
     def __init__(self) -> None:
@@ -317,13 +427,15 @@ async def test_cancelling_serve_leaves_no_task_behind():
     running with nothing left holding a reference to them.
     """
 
-    class SilentWebSocket(FakeWebSocket):
+    class SilentWebSocket(MockWebSocket):
         async def receive_text(self) -> str:
             await asyncio.Event().wait()  # a peer that never sends and never leaves
             raise AssertionError("unreachable")
 
-    conn = Connection(SilentWebSocket(), "s", send_queue_size=8)
-    serving = asyncio.create_task(ConnectionHandler(conn, StubResponder(), Settings()).serve())
+    conn = Connection(SilentWebSocket(), uuid.uuid4(), send_queue_size=8)
+    serving = asyncio.create_task(
+        ConnectionHandler(conn, MockChatRepository(), StubResponder(), Settings()).serve()
+    )
     await asyncio.sleep(0)  # let serve() spawn both tasks and park in asyncio.wait
 
     serving.cancel()
@@ -340,7 +452,7 @@ async def test_send_queue_overflow_drops_the_connection():
     Dropping is only the right answer because durability lives elsewhere: from
     1b the client reconnects and replays what it missed.
     """
-    conn = Connection(FakeWebSocket(), "s", send_queue_size=2)
+    conn = Connection(MockWebSocket(), uuid.uuid4(), send_queue_size=2)
     for _ in range(6):
         conn.send(Pong())
 
@@ -352,8 +464,8 @@ async def test_send_queue_overflow_drops_the_connection():
 
 async def test_drain_sends_going_away_then_closes_with_service_restart():
     """Kubernetes does not drain WebSockets; this is what stands in for it."""
-    fake = FakeWebSocket()
-    conn = Connection(fake, "s", send_queue_size=8)
+    mock = MockWebSocket()
+    conn = Connection(mock, uuid.uuid4(), send_queue_size=8)
     registry = ConnectionRegistry(max_per_session=4, drain_timeout_seconds=1.0)
     assert registry.add(conn)
 
@@ -370,7 +482,7 @@ async def test_drain_sends_going_away_then_closes_with_service_restart():
     # Bounded for the same reason as the overflow test: a drain that stops
     # closing connections would otherwise hang here instead of failing.
     assert await asyncio.wait_for(serving, timeout=2.0) == WS_SERVICE_RESTART
-    assert json.loads(fake.sent[0])["code"] == ErrorCode.GOING_AWAY
+    assert json.loads(mock.sent[0])["code"] == ErrorCode.GOING_AWAY
 
 
 @pytest.mark.parametrize(
@@ -396,11 +508,11 @@ async def test_a_write_that_loses_the_race_with_a_disconnect_closes_normally(exc
     which is noise in exactly the logs you read during a rollout.
     """
 
-    class FailingWebSocket(FakeWebSocket):
+    class FailingWebSocket(MockWebSocket):
         async def send_text(self, text: str) -> None:
             raise exc
 
-    conn = Connection(FailingWebSocket(), "s", send_queue_size=8)
+    conn = Connection(FailingWebSocket(), uuid.uuid4(), send_queue_size=8)
     conn.send(Pong())
 
     assert await asyncio.wait_for(conn.run_writer(), timeout=2.0) == WS_NORMAL
@@ -408,7 +520,7 @@ async def test_a_write_that_loses_the_race_with_a_disconnect_closes_normally(exc
 
 async def test_drain_does_not_wait_past_its_timeout():
     """A connection that will not flush must not hold the pod past its grace period."""
-    conn = Connection(FakeWebSocket(), "s", send_queue_size=8)  # nothing ever drains it
+    conn = Connection(MockWebSocket(), uuid.uuid4(), send_queue_size=8)  # nothing ever drains it
     registry = ConnectionRegistry(max_per_session=4, drain_timeout_seconds=0.05)
     registry.add(conn)
 
@@ -421,21 +533,23 @@ async def test_drain_does_not_wait_past_its_timeout():
 def test_the_registry_refuses_a_connection_past_the_cap():
     """The cap itself, with no socket in the way to turn a regression into a hang."""
     registry = ConnectionRegistry(max_per_session=1, drain_timeout_seconds=1.0)
+    session = uuid.uuid4()
 
-    assert registry.add(Connection(FakeWebSocket(), "s", send_queue_size=8)) is True
-    assert registry.add(Connection(FakeWebSocket(), "s", send_queue_size=8)) is False
+    assert registry.add(Connection(MockWebSocket(), session, send_queue_size=8)) is True
+    assert registry.add(Connection(MockWebSocket(), session, send_queue_size=8)) is False
     # A different session is unaffected — the cap is per session, not per replica.
-    assert registry.add(Connection(FakeWebSocket(), "other", send_queue_size=8)) is True
+    assert registry.add(Connection(MockWebSocket(), uuid.uuid4(), send_queue_size=8)) is True
 
 
 def test_the_registry_forgets_sessions_it_no_longer_holds():
     """Otherwise a long-lived process accumulates an entry per session ever seen."""
     registry = ConnectionRegistry(max_per_session=2, drain_timeout_seconds=1.0)
-    conn = Connection(FakeWebSocket(), "s", send_queue_size=8)
+    session = uuid.uuid4()
+    conn = Connection(MockWebSocket(), session, send_queue_size=8)
 
     registry.add(conn)
-    assert registry.for_session("s") == [conn]
+    assert registry.for_session(session) == [conn]
     registry.remove(conn)
 
     assert len(registry) == 0
-    assert registry.for_session("s") == []
+    assert registry.for_session(session) == []

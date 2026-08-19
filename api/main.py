@@ -3,10 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from adapters import db
+from adapters.postgres import db
+from adapters.postgres.chat_repository import PostgresChatRepository
 from api import chat, health
 from core.config import get_settings
-from core.protocol import Error, ErrorCode
+from core.frames import Error, ErrorCode
 from core.responder import StubResponder
 from core.ws import ConnectionRegistry
 
@@ -28,6 +29,11 @@ async def lifespan(app: FastAPI):
 
     app.state.settings = settings
     app.state.db = db.Database(settings)
+    # Built from the same Database, so it shares the one pool and the one
+    # lifecycle. Unused until the handler starts persisting turns; it is here
+    # now because the composition root is the only place allowed to choose an
+    # implementation.
+    app.state.chat_repository = PostgresChatRepository(app.state.db)
     app.state.chat_registry = ConnectionRegistry(
         max_per_session=settings.ws_max_connections_per_session,
         drain_timeout_seconds=settings.ws_drain_timeout_seconds,

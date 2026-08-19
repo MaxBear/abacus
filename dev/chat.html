@@ -145,7 +145,7 @@ let autoSay = null;               // ?say=… , sent once the socket opens
 let pingTimer = null;
 let pingSentAt = 0;
 let seq = 0;                      // client_msg_id counter
-const turns = new Map();          // message_id -> {el, chunks, next, started}
+const turns = new Map();          // reply_message_id -> {el, chunks, next, started}
 const pending = new Map();        // client_msg_id -> {el, at}
 
 function uuid() {
@@ -240,13 +240,21 @@ function handleFrame(data) {
     const p = pending.get(f.client_msg_id);
     if (p) {
       p.el.querySelector(".meta").textContent =
-        `ack in ${Math.round(performance.now() - p.at)}ms → ${f.message_id}`;
+        `ack in ${Math.round(performance.now() - p.at)}ms → seq ${f.seq}`;
       pending.delete(f.client_msg_id);
     } else {
       log("!", `ack for unknown client_msg_id ${f.client_msg_id}`, "err");
     }
-    const el = bubble("a", `assistant · ${f.message_id.slice(0, 8)}`, "", p && p.el);
-    turns.set(f.message_id, { el, chunks: 0, next: 0, started: performance.now() });
+    // reply_message_id, never message_id: the ack names the user's row, the
+    // stream names the assistant's, and binding deltas to the former matches
+    // nothing. Absent means the key was already recorded and no turn for it is
+    // running on this socket — the reply, if any, is in the log.
+    if (!f.reply_message_id) {
+      log("!", `already recorded at seq ${f.seq} — no live reply on this socket`);
+      return;
+    }
+    const el = bubble("a", `assistant · ${f.reply_message_id.slice(0, 8)}`, "", p && p.el);
+    turns.set(f.reply_message_id, { el, chunks: 0, next: 0, started: performance.now() });
     return;
   }
 
@@ -267,7 +275,7 @@ function handleFrame(data) {
     const t = turns.get(f.message_id);
     if (!t) { log("!", `done for unknown message_id ${f.message_id}`, "err"); return; }
     t.el.querySelector(".meta").textContent =
-      `${t.chunks} chunks in ${Math.round(performance.now() - t.started)}ms`;
+      `${t.chunks} chunks in ${Math.round(performance.now() - t.started)}ms · seq ${f.seq}`;
     turns.delete(f.message_id);
     return;
   }

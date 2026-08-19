@@ -85,11 +85,24 @@ class _ServerFrame(BaseModel):
 
 
 class Ack(_ServerFrame):
-    """The message was accepted. 1b adds `seq` and makes this mean *durable*."""
+    """The message is durable: it is a row in this session, at this `seq`.
+
+    Two identities, because a turn is two rows. `message_id` names the user's
+    message — the thing being acknowledged. `reply_message_id` names the
+    assistant row that `delta` and `done` will carry, which is what lets the
+    client bind the stream to the bubble it drew before either row existed.
+
+    `reply_message_id` is absent when the key was already recorded and no turn
+    for it is running on this connection — a resubmit after a reconnect. There
+    is no live stream to name: the original turn died with the socket that
+    started it, and the row it left behind is what resume delivers.
+    """
 
     type: Literal["ack"] = "ack"
     client_msg_id: str
+    seq: int
     message_id: str
+    reply_message_id: str | None = None
 
 
 class Delta(_ServerFrame):
@@ -107,8 +120,17 @@ class Delta(_ServerFrame):
 
 
 class Done(_ServerFrame):
+    """The reply is complete and its text is final.
+
+    Carries the assistant row's `seq`, allocated when that row was opened rather
+    than now — so `seq` orders messages by creation, and interleaved turns still
+    sort into a readable transcript. `delta` carries none: a chunk is a
+    rendering detail, not a durable fact.
+    """
+
     type: Literal["done"] = "done"
     message_id: str
+    seq: int
 
 
 class Error(_ServerFrame):

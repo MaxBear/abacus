@@ -55,12 +55,12 @@ code and holding through phase 6; this section is the summary, that document is 
 Split in two, because persistence is a different concern from transport and phase 0's habit is one
 concern per PR:
 
-**1a — transport.** `/ws/chat/{session_id}`, versioned JSON frame envelope in `core/protocol.py`,
+**1a — transport.** `/ws/chat/{session_id}`, versioned JSON frame envelope in `core/frames.py`,
 connection lifecycle with heartbeat, an in-memory session registry, and a streaming stub responder
 behind a Protocol. Messages do not survive the connection.
 
 **1b — persistence.** Alembic bootstrap, `chat_sessions` / `chat_messages`, `seq` allocation,
-`resume` on reconnect, `client_msg_id` idempotency. This is what `adapters/db.py:37` is waiting for:
+`resume` on reconnect, `client_msg_id` idempotency. This is what `adapters/postgres/db.py:37` is waiting for:
 *"Nothing calls this until phase 1 adds real queries."*
 
 **Acceptance.** Handshake, authorization rejection, frame round-trips, and the close-code contract
