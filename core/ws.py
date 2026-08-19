@@ -8,12 +8,13 @@ the way. Nothing here knows what a frame means.
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
 
 import anyio
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
-from core.protocol import ServerFrame
+from core.frames import ServerFrame
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,9 @@ class Connection:
     two ways one slow reader takes down every other session on the replica.
     """
 
-    def __init__(self, websocket: WebSocket, session_id: str, *, send_queue_size: int) -> None:
+    def __init__(
+        self, websocket: WebSocket, session_id: uuid.UUID, *, send_queue_size: int
+    ) -> None:
         self._ws = websocket
         self.session_id = session_id
         self._out: asyncio.Queue[ServerFrame | _Close] = asyncio.Queue(maxsize=send_queue_size)
@@ -168,7 +171,7 @@ class ConnectionRegistry:
     def __init__(self, *, max_per_session: int, drain_timeout_seconds: float) -> None:
         self._max_per_session = max_per_session
         self._drain_timeout = drain_timeout_seconds
-        self._by_session: dict[str, set[Connection]] = {}
+        self._by_session: dict[uuid.UUID, set[Connection]] = {}
 
     def add(self, conn: Connection) -> bool:
         """Register a connection. False when the session is already at its cap."""
@@ -188,7 +191,7 @@ class ConnectionRegistry:
         if not conns:
             del self._by_session[conn.session_id]
 
-    def for_session(self, session_id: str) -> list[Connection]:
+    def for_session(self, session_id: uuid.UUID) -> list[Connection]:
         """Connections held here for a session. Phase 3's fanout delivers via this."""
         return list(self._by_session.get(session_id, ()))
 

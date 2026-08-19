@@ -1,6 +1,6 @@
-"""In-memory stand-ins for the Protocols in `core/`.
+"""An in-memory stand-in for the `ChatRepository` Protocol in `core/`.
 
-Here rather than in `core/` because they are test doubles, not a second
+Here rather than in `core/` because it is a test double, not a second
 supported implementation: nothing that ships imports this module.
 """
 
@@ -10,7 +10,7 @@ from dataclasses import replace
 from core.repository import RecordedUserMessage, Role, Status, StoredMessage
 
 
-class FakeChatRepository:
+class MockChatRepository:
     """`ChatRepository` in dictionaries, for tests that must not need a container.
 
     Faithful about ordering, gap-freeness, and idempotency *outcomes*. It cannot
@@ -18,7 +18,7 @@ class FakeChatRepository:
     the row lock that serializes concurrent allocation, and `on conflict`'s
     atomicity — because a single-threaded dict has no races to lose. The tests
     that cover those live in the postgres-only section of
-    `tests/test_chat_repository.py`, and a passing fake proves nothing about them.
+    `tests/test_chat_repository.py`, and a passing mock proves nothing about them.
     """
 
     def __init__(self) -> None:
@@ -72,8 +72,8 @@ class FakeChatRepository:
     ) -> list[StoredMessage]:
         rows = [
             message
-            for owner, message in self._rows.values()
-            if owner == session_id and message.seq > after_seq
+            for row_session_id, message in self._rows.values()
+            if row_session_id == session_id and message.seq > after_seq
         ]
         return sorted(rows, key=lambda m: m.seq)[:limit]
 

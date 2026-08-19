@@ -2,8 +2,9 @@
 
 Infrastructure, so it lives here rather than in `core/`: the repository Protocol
 the handler depends on is domain, its Postgres implementation and these tables
-are not. Named `tables` rather than `models` because `core/protocol.py` already
-owns "model" in this codebase, for the Pydantic frame types on the wire.
+are not. Named `tables` rather than `models` because "model" is the vaguest
+word available for a file whose whole job is the physical schema — and the
+Pydantic types on the wire, which would be the other claimant, are `frames`.
 
 Alembic's `env.py` imports `metadata` from here and nothing else, so autogenerate
 sees the schema without importing the API.

@@ -55,7 +55,7 @@ code and holding through phase 6; this section is the summary, that document is 
 Split in two, because persistence is a different concern from transport and phase 0's habit is one
 concern per PR:
 
-**1a — transport.** `/ws/chat/{session_id}`, versioned JSON frame envelope in `core/protocol.py`,
+**1a — transport.** `/ws/chat/{session_id}`, versioned JSON frame envelope in `core/frames.py`,
 connection lifecycle with heartbeat, an in-memory session registry, and a streaming stub responder
 behind a Protocol. Messages do not survive the connection.
 

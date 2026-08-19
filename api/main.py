@@ -7,7 +7,7 @@ from adapters.postgres import db
 from adapters.postgres.chat_repository import PostgresChatRepository
 from api import chat, health
 from core.config import get_settings
-from core.protocol import Error, ErrorCode
+from core.frames import Error, ErrorCode
 from core.responder import StubResponder
 from core.ws import ConnectionRegistry
 

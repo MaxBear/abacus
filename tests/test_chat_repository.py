@@ -1,11 +1,11 @@
 """Phase 1b: the persistence contract, run against both implementations.
 
-Every test in the first section runs twice — once against the in-memory fake,
-once against real Postgres if one is reachable. That is the point: a fake the
+Every test in the first section runs twice — once against the in-memory mock,
+once against real Postgres if one is reachable. That is the point: a mock the
 handler's tests trust is only useful if something proves it does not lie.
 
 The second section is postgres-only, and covers the two claims
-`docs/persistence.md` says a fake cannot falsify — gap-free allocation under
+`docs/persistence.md` says a mock cannot falsify — gap-free allocation under
 concurrency, and the atomicity of the idempotent insert. Both are properties of
 a row lock and of `on conflict`, neither of which a dict has.
 
@@ -26,7 +26,7 @@ from adapters.postgres.db import Database
 from adapters.postgres.tables import chat_sessions
 from core.config import get_settings
 from core.repository import Role, Status
-from tests.fakes import FakeChatRepository
+from tests.MockChatRepository import MockChatRepository
 
 
 @pytest.fixture
@@ -55,10 +55,10 @@ async def _postgres(created_sessions):
         await db.dispose()
 
 
-@pytest.fixture(params=["fake", "postgres"])
+@pytest.fixture(params=["mock", "postgres"])
 async def repo(request, created_sessions):
-    if request.param == "fake":
-        yield FakeChatRepository()
+    if request.param == "mock":
+        yield MockChatRepository()
     else:
         async for r in _postgres(created_sessions):
             yield r
@@ -89,9 +89,9 @@ async def test_ensure_session_is_idempotent(repo, session_id):
 async def test_a_turn_takes_two_contiguous_seqs(repo, session_id):
     user = await repo.record_user_message(session_id, "c1", "hi")
     assistant = await repo.start_assistant_message(session_id)
-    second = await repo.record_user_message(session_id, "c2", "again")
+    second_user = await repo.record_user_message(session_id, "c2", "again")
 
-    assert [user.message.seq, assistant.seq, second.message.seq] == [1, 2, 3]
+    assert [user.message.seq, assistant.seq, second_user.message.seq] == [1, 2, 3]
     assert user.message.message_id != assistant.message_id
 
 
@@ -185,7 +185,7 @@ async def test_an_unknown_session_raises_rather_than_inventing_one(repo):
 
 
 # --------------------------------------------------------------------------
-# Postgres only: what the fake cannot falsify
+# Postgres only: what the mock cannot falsify
 # --------------------------------------------------------------------------
 
 

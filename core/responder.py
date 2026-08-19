@@ -1,6 +1,6 @@
 """The seam the LLM gateway will later fill.
 
-Kept apart from `core/protocol.py` because the two change for unrelated reasons:
+Kept apart from `core/frames.py` because the two change for unrelated reasons:
 the frame models move when the wire format does — a new frame type, a new field,
 a version bump — while this moves when the thing *producing* replies changes.
 Phase 4 replaces the implementation below without touching a frame, and 1b adds

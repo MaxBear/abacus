@@ -73,13 +73,13 @@ machinery that does not extend here.
 ## The frame protocol
 
 JSON text frames. Every frame carries `v` (protocol version) and `type` (discriminator). Pydantic
-models in `core/protocol.py` own both directions, so the wire format has one definition and FastAPI's
+models in `core/frames.py` own both directions, so the wire format has one definition and FastAPI's
 validation applies to inbound frames the same way it does to request bodies.
 
 Binary frames are unused today. If artifact payloads ever want them, they get a separate opcode
 path — never a magic string inside a text frame.
 
-A frame type is **defined here only when the phase that implements it lands**. `core/protocol.py` carries
+A frame type is **defined here only when the phase that implements it lands**. `core/frames.py` carries
 exactly the types the server actually honors — nothing is stubbed ahead of time, because a `cancel`
 that silently does nothing is indistinguishable, from the client's side, from one that worked.
 
@@ -96,17 +96,22 @@ that silently does nothing is indistinguishable, from the client's side, from on
 
 | type | payload | phase | notes |
 | --- | --- | --- | --- |
-| `ack` | `client_msg_id`, `message_id` | 1a | the message is accepted; 1b adds `seq` and makes it durable |
+| `ack` | `client_msg_id`, `seq`, `message_id`, `reply_message_id` | 1b | the message is a durable row at `seq`; `reply_message_id` names the stream |
 | `delta` | `message_id`, `chunk_index`, `text` | 1a | one chunk of an assistant turn |
-| `done` | `message_id` | 1a | the turn is complete |
+| `done` | `message_id`, `seq` | 1b | the turn is complete and its text is final |
 | `error` | `code`, `message`, `retryable` | 1a | application error; the socket stays open |
 | `pong` | — | 1a | |
 | `job_status` | `seq`, `job_id`, `state`, `progress` | 2 | `queued`/`running`/`done`/`failed` |
 
 `delta` carries `(message_id, chunk_index)` rather than a session `seq`, which is what lets several
 turns stream concurrently on one socket without ambiguity — see the open question on sequence spaces.
-`seq` itself does not exist until 1b; adding the field before there is a durable log to allocate it
-from would be a lie the client would reasonably act on.
+
+A turn is two rows, so `ack` carries two identities. `message_id` is the user's message, the thing
+being acknowledged; `reply_message_id` is the assistant row `delta` and `done` will name, which is
+what binds the stream to the message that caused it. `reply_message_id` is **absent** when the
+`client_msg_id` was already recorded and no turn for it is running on that connection — a resubmit
+after a reconnect, whose original turn died with the socket that started it. The reply is then a
+completed or failed row, and `resume` is what delivers it.
 
 `error` is a frame, not a close. Closing the socket on a bad user message conflates "this request
 was wrong" with "this connection is unusable", and clients reconnect on close — so a malformed

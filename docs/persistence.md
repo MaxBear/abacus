@@ -179,7 +179,7 @@ rejected as `bad_frame` — deliberately, per the PR that landed 1a.
 5. **`client_msg_id` idempotency** on the insert path.
 6. **`resume`** as a client frame, plus `resume_too_old`.
 
-Steps 4–6 each change `core/protocol.py`, so they are additive frame changes under the existing `v1`
+Steps 4–6 each change `core/frames.py`, so they are additive frame changes under the existing `v1`
 — no version bump, since a client that ignores `seq` still works.
 
 ## Testing
