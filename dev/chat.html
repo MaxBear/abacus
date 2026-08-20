@@ -145,6 +145,8 @@ let autoSay = null;               // ?say=… , sent once the socket opens
 let pingTimer = null;
 let pingSentAt = 0;
 let seq = 0;                      // client_msg_id counter
+let lastSeq = 0;                  // highest session seq applied — the resume cursor
+let cursorSession = null;         // which session lastSeq belongs to
 const turns = new Map();          // reply_message_id -> {el, chunks, next, started}
 const pending = new Map();        // client_msg_id -> {el, at}
 
@@ -236,6 +238,11 @@ function handleFrame(data) {
   let f;
   try { f = JSON.parse(data); } catch { log("!", "server sent non-json", "err"); return; }
 
+  // Every frame that carries a session seq advances the resume cursor. Taking
+  // the max rather than assigning is what makes replay idempotent: the server
+  // is at-least-once, so a frame can arrive twice and must not rewind us.
+  if (typeof f.seq === "number" && f.seq > lastSeq) lastSeq = f.seq;
+
   if (f.type === "ack") {
     const p = pending.get(f.client_msg_id);
     if (p) {
@@ -280,6 +287,17 @@ function handleFrame(data) {
     return;
   }
 
+  if (f.type === "message") {
+    // A stored row, replayed whole — not the deltas the turn originally
+    // streamed. Rendering it as one bubble reaches the same end state, which is
+    // the entire argument for not re-streaming tokens on reconnect.
+    const mine = f.role === "user";
+    const el = bubble(mine ? "u" : "a", `${mine ? "you" : "assistant"} · replayed`, f.text);
+    el.querySelector(".meta").textContent =
+      `seq ${f.seq} · ${f.status}` + (f.status === "failed" ? " — this turn died with its socket" : "");
+    return;
+  }
+
   if (f.type === "pong") {
     const rtt = pingSentAt ? `${Math.round(performance.now() - pingSentAt)}ms` : "?";
     log("!", `pong — rtt ${rtt}`);
@@ -318,7 +336,11 @@ function socketUrl(session, version) {
 }
 
 function connect() {
-  const url = socketUrl($("session").value.trim());
+  const session = $("session").value.trim();
+  // `seq` is per session, so a cursor from a different one would skip history
+  // that this session never sent. Reset rather than carry it over.
+  if (session !== cursorSession) { lastSeq = 0; cursorSession = session; }
+  const url = socketUrl(session);
   status(`connecting — ${url}`);
   log("!", `connect ${url}`);
   ws = new WebSocket(url);
@@ -327,6 +349,11 @@ function connect() {
     status(`open — ${url}`);
     log("!", "open");
     setLive(true);
+    // Before anything else on the socket: a message sent first would
+    // interleave its own ack into the replay. lastSeq is 0 on a fresh tab,
+    // which asks for the session from the beginning — that is how opening an
+    // existing session id shows its history.
+    raw({ v: 1, type: "resume", last_seq: lastSeq });
     if ($("autoping").checked) pingTimer = setInterval(() => ping(), 20000);
     if (autoSay !== null) { sendMessage(autoSay); autoSay = null; }
   };

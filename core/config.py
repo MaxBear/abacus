@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     ws_max_connections_per_session: int = 8
     ws_max_concurrent_turns: int = 4
 
+    # How much history one `resume` may replay. A client further behind than
+    # this gets `resume_too_old` and reloads over plain HTTP instead: unbounded
+    # replay turns a week-old tab into a full history dump on a single
+    # reconnect, down a socket whose send queue is 64 frames deep.
+    ws_resume_max_messages: int = 200
+
     # Must stay well inside the container's stop_grace_period, or the drain is
     # cut short by SIGKILL and accomplishes nothing.
     ws_drain_timeout_seconds: float = 5.0

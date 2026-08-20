@@ -19,49 +19,23 @@ import contextlib
 import uuid
 
 import pytest
-from sqlalchemy import delete, text
+from sqlalchemy import text
 
-from adapters.postgres.chat_repository import PostgresChatRepository
-from adapters.postgres.db import Database
-from adapters.postgres.tables import chat_sessions
-from core.config import get_settings
 from core.repository import Role, Status
 from tests.MockChatRepository import MockChatRepository
 
 
-@pytest.fixture
-def created_sessions() -> list[uuid.UUID]:
-    """Session ids a test made, for the postgres fixture to clean up after."""
-    return []
-
-
-async def _postgres(created_sessions):
-    db = Database(get_settings())
-    try:
-        await db.ping()
-    except Exception:  # noqa: BLE001 - any failure to reach it means "not available"
-        await db.dispose()
-        pytest.skip("no postgres reachable — `make up && make migrate` enables these")
-
-    try:
-        yield PostgresChatRepository(db)
-    finally:
-        # chat_messages goes with it: the FK is ON DELETE CASCADE.
-        if created_sessions:
-            async with db.session() as s:
-                stmt = delete(chat_sessions).where(chat_sessions.c.id.in_(created_sessions))
-                await s.execute(stmt)
-                await s.commit()
-        await db.dispose()
-
-
 @pytest.fixture(params=["mock", "postgres"])
-async def repo(request, created_sessions):
+def repo(request):
+    """The contract under test, once per implementation.
+
+    `getfixturevalue` rather than requesting `postgres_repo` outright: naming it
+    in the signature would build a database connection for the `mock` run too,
+    and skip both when none is reachable.
+    """
     if request.param == "mock":
-        yield MockChatRepository()
-    else:
-        async for r in _postgres(created_sessions):
-            yield r
+        return MockChatRepository()
+    return request.getfixturevalue("postgres_repo")
 
 
 @pytest.fixture
@@ -190,9 +164,9 @@ async def test_an_unknown_session_raises_rather_than_inventing_one(repo):
 
 
 @pytest.fixture
-async def pg(created_sessions):
-    async for r in _postgres(created_sessions):
-        yield r
+def pg(postgres_repo):
+    """The shared postgres fixture, under the short name these tests read with."""
+    return postgres_repo
 
 
 @pytest.fixture
