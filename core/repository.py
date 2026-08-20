@@ -136,7 +136,12 @@ class ChatRepository(Protocol):
     async def messages_since(
         self, session_id: uuid.UUID, after_seq: int, limit: int
     ) -> list[StoredMessage]:
-        """Completed history after `after_seq`, in `seq` order, at most `limit`.
+        """History after `after_seq`, in `seq` order, at most `limit`.
+
+        Every row, in whatever state it holds — not just completed ones. A reply
+        whose socket died mid-turn is `failed`, and resume has to hand that back
+        rather than hide it: a client told nothing would wait forever for a turn
+        that is never coming.
 
         The bound is not politeness: unbounded replay turns a week-old tab into
         a full history dump on a single reconnect.

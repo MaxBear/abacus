@@ -152,8 +152,17 @@ select seq, message_id, role, status, text
  limit $3;
 ```
 
-Bounded by `$3` per `websocket.md:152-155`. A client whose `last_seq` is below the oldest retained
-row gets `resume_too_old` and reloads over plain HTTP. The `(session_id, seq)` index serves this as
+Bounded by `$3` (`ws_resume_max_messages`, 200). There are two ways a cursor can be unusable, and
+only one of them is reachable today:
+
+- **Too far behind.** More rows exist after `last_seq` than the bound will replay. This is what is
+  implemented: ask for `limit + 1`, and a full extra row means the client is past the bound. It
+  refuses rather than truncating, because a truncated replay hands the client a gap it cannot see —
+  it advances its cursor past frames it never received and never asks again.
+- **Below the oldest retained row.** Unreachable until something deletes, since `seq` 1 is always
+  still there. It becomes the second trigger the day a retention window lands; see Open.
+
+Either way the client gets `resume_too_old` and reloads over plain HTTP. The `(session_id, seq)` index serves this as
 a single range scan, confirmed against the real database — no sort node, since the index already
 supplies the order:
 
@@ -163,8 +172,14 @@ Limit
         Index Cond: ((session_id = '…'::uuid) AND (seq > 1))
 ```
 
-`resume` must be handled **before** anything else on a reconnected socket, and it is currently
-rejected as `bad_frame` — deliberately, per the PR that landed 1a.
+`resume` must be sent **before** anything else on a reconnected socket. Nothing on the server
+enforces that — it cannot, since a first frame is a first frame — but a client that submits first
+interleaves its own `ack` into the replay and has to reconcile the two orderings itself.
+
+Replayed rows arrive as `message` frames, one per row, carrying `(seq, message_id, role, status,
+text)` — the select list above, unchanged. `status` is on the wire because a replayed assistant row
+is not always finished: a reply whose socket died mid-turn comes back `failed`, and a client that
+assumed otherwise would render a truncated answer as though the model meant to stop there.
 
 ## Work, in dependency order
 
@@ -201,9 +216,10 @@ say. Use `asyncio.wait_for`.
 
 ## Open
 
-- **Retention.** Nothing above deletes anything, so `chat_messages` grows without bound and
-  `resume_too_old` can never fire. A retention window is what makes that error reachable, and it is
-  the input to whether this table needs partitioning by time later.
+- **Retention.** Nothing above deletes anything, so `chat_messages` grows without bound. That no
+  longer makes `resume_too_old` unreachable — the depth bound fires on its own — but it does leave
+  the second trigger for that error unimplemented, and it is the input to whether this table needs
+  partitioning by time later.
 - **Multi-tab writes.** Two sockets on one session now contend for the same `next_seq` row. Ordering
   stays correct; whether a second tab *should* be able to submit mid-turn is still the product
   question `websocket.md` flags, not a transport one.

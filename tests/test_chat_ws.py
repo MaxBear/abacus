@@ -205,6 +205,186 @@ def test_a_turn_that_raises_leaves_the_row_failed_not_streaming(client, reposito
     ]
 
 
+# --------------------------------------------------------------------------
+# Resume
+# --------------------------------------------------------------------------
+
+
+def _say_and_settle(ws, text: str, client_msg_id: str) -> dict:
+    """Send one message and drain to `done`. Returns the ack."""
+    ws.send_json({"type": "user_message", "text": text, "client_msg_id": client_msg_id})
+    ack = ws.receive_json()
+    while ws.receive_json()["type"] != "done":
+        pass
+    return ack
+
+
+def _resume(ws, last_seq: int) -> list[dict]:
+    """Resume, and collect the replay up to a trailing ping's pong.
+
+    The ping is a terminator, not decoration. `docs/persistence.md` records the
+    trap: a test that reads a fixed number of frames *hangs* rather than fails
+    when replay returns too few, because a healthy socket with nothing to say is
+    simply silent. Measuring "nothing came" needs something that must come.
+
+    Sound because the read loop awaits each dispatch to completion, so the
+    resume is fully replayed before the ping is even parsed — the pong can never
+    overtake a frame the replay owes us.
+    """
+    ws.send_json({"type": "resume", "last_seq": last_seq})
+    ws.send_json({"type": "ping"})
+    frames = []
+    while (frame := ws.receive_json())["type"] != "pong":
+        frames.append(frame)
+    return frames
+
+
+def test_resume_replays_stored_messages_in_seq_order(client):
+    """The reconnect path: a cursor of 0 asks for the session from the start.
+
+    Whole messages, not the deltas the turn originally streamed — the accumulated
+    text reaches the same rendered state in one frame instead of one per chunk.
+    """
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "hello", "c1")
+        replayed = _resume(ws, 0)
+
+    assert [f["type"] for f in replayed] == ["message", "message"]
+    assert [f["seq"] for f in replayed] == [1, 2]
+
+    user, assistant = replayed
+    assert user["role"] == Role.USER
+    assert user["text"] == "hello"
+    assert assistant["role"] == Role.ASSISTANT
+    assert assistant["status"] == Status.COMPLETE
+    # The whole reply in one frame, not the four the stub streamed as deltas.
+    assert assistant["text"] == "echo: hello "
+
+
+def test_resume_is_exclusive_of_the_clients_cursor(client):
+    """`last_seq` is what the client already applied, so replay starts after it.
+
+    Inclusive would redeliver the message the client is holding — harmless only
+    because clients dedupe on `seq`, and leaning on that to paper over an
+    off-by-one is how the dedupe stops being a safety net.
+    """
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "hello", "c1")
+        replayed = _resume(ws, 1)
+
+    assert [f["seq"] for f in replayed] == [2]
+    assert replayed[0]["role"] == Role.ASSISTANT
+
+
+def test_resume_at_the_head_replays_nothing(client):
+    """A client that missed nothing gets nothing, and must not wait for it."""
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "hello", "c1")
+
+        assert _resume(ws, 2) == []
+
+
+def test_a_resume_further_back_than_the_bound_is_refused_not_truncated(client):
+    """Truncating would hand the client a gap it cannot detect.
+
+    It would advance its cursor past frames it never received and never ask for
+    them again. `resume_too_old` says the cursor is unusable, which is the one
+    answer that sends the client to a full reload instead.
+    """
+    app.dependency_overrides[deps.get_settings] = lambda: Settings(ws_resume_max_messages=2)
+
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "one", "c1")  # seq 1, 2
+        _say_and_settle(ws, "two", "c2")  # seq 3, 4
+        replayed = _resume(ws, 0)  # four messages, bound is two
+
+    assert [f["type"] for f in replayed] == ["error"]
+    assert replayed[0]["code"] == ErrorCode.RESUME_TOO_OLD
+    # Not retryable: the same cursor fails the same way forever. The client has
+    # to reload over HTTP, not back off and ask again.
+    assert replayed[0]["retryable"] is False
+
+
+def test_resume_exactly_at_the_bound_still_replays(client):
+    """The boundary the `limit + 1` query exists to get right.
+
+    Off by one here and a client sitting exactly on the bound is told to reload
+    for history the server was perfectly willing to send.
+    """
+    app.dependency_overrides[deps.get_settings] = lambda: Settings(ws_resume_max_messages=2)
+
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "hello", "c1")  # exactly two rows
+        replayed = _resume(ws, 0)
+
+    assert [f["type"] for f in replayed] == ["message", "message"]
+
+
+def test_resume_hands_back_a_failed_reply_rather_than_hiding_it(client):
+    """A turn that died is a fact the client needs, not one to omit.
+
+    Replaying only completed rows would leave the client waiting forever for a
+    reply that is never coming — the spinner that never resolves, moved from the
+    original socket onto the reconnected one.
+    """
+
+    class FailingResponder:
+        async def respond(self, text: str):
+            raise RuntimeError("boom")
+            yield ""  # pragma: no cover - makes this an async generator
+
+    app.dependency_overrides[deps.get_responder] = FailingResponder
+
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        assert ws.receive_json()["type"] == "ack"
+        assert ws.receive_json()["type"] == "error"
+        replayed = _resume(ws, 1)
+
+    assert [f["seq"] for f in replayed] == [2]
+    assert replayed[0]["status"] == Status.FAILED
+
+
+def test_resume_is_answered_even_at_the_turn_cap(client):
+    """Replay starts no turn, so the turn cap must not gate it.
+
+    A client that reconnected mid-solve is both the most likely to be at the cap
+    and the most in need of what it missed; refusing there would deny history to
+    exactly the session that lost some.
+    """
+
+    class SlowResponder:
+        async def respond(self, text: str):
+            await asyncio.sleep(30)
+            yield text  # pragma: no cover - the test never lets it get here
+
+    app.dependency_overrides[deps.get_responder] = SlowResponder
+    app.dependency_overrides[deps.get_settings] = lambda: Settings(ws_max_concurrent_turns=1)
+
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "user_message", "text": "hello", "client_msg_id": "c1"})
+        assert ws.receive_json()["type"] == "ack"
+
+        # At the cap: a second message is refused...
+        ws.send_json({"type": "user_message", "text": "again", "client_msg_id": "c2"})
+        assert ws.receive_json()["code"] == ErrorCode.TOO_MANY_TURNS
+
+        replayed = _resume(ws, 0)  # ...but resume is not a turn.
+
+    assert [f["type"] for f in replayed] == ["message", "message"]
+
+
+def test_a_negative_resume_cursor_is_a_bad_frame(client):
+    """`seq` starts at 1, so 0 already means "I have nothing".
+
+    A negative cursor can only be a client bug, and quietly widening the range
+    for it would hide that rather than surface it.
+    """
+    with client.websocket_connect(URL) as ws:
+        ws.send_json({"type": "resume", "last_seq": -1})
+        assert ws.receive_json()["code"] == ErrorCode.BAD_FRAME
+
+
 def test_ping_is_answered_with_pong(client):
     with client.websocket_connect(URL) as ws:
         ws.send_json({"type": "ping"})
@@ -553,3 +733,85 @@ def test_the_registry_forgets_sessions_it_no_longer_holds():
 
     assert len(registry) == 0
     assert registry.for_session(session) == []
+
+
+# --------------------------------------------------------------------------
+# Phase 1b acceptance, against the real database
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pg_client(postgres_repo):
+    """A client with no repository override, so the app's own wiring is used.
+
+    The acceptance test is the one place a mock proves nothing: what it checks
+    is that durable state and the transport agree, and a mock only ever agrees
+    with itself. `lifespan` already builds a real `PostgresChatRepository`, so
+    the way to get one here is to override nothing.
+
+    `postgres_repo` is requested for the two things it does *not* hand over —
+    the skip when no database answers, and the row cleanup afterwards. Its pool
+    belongs to the fixture's event loop while TestClient runs the app on its
+    own, and an asyncpg connection cannot cross loops: passing that repository
+    into the app fails on the first query, loudly and confusingly.
+    """
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.postgres
+def test_a_socket_killed_mid_turn_loses_nothing(pg_client, created_sessions):
+    """roadmap.md's sentence for the whole phase, executed.
+
+    A solve runs 30 seconds to five minutes. If a dropped connection can lose
+    one, no amount of reconnect logic repairs the product — so every frame the
+    client received has to be reconstructible from Postgres alone.
+
+    What survives the kill, and what does not, is the honest 1b answer: the
+    user's question is durable and replays verbatim; a completed reply replays
+    whole; and the reply that was mid-flight comes back `failed` rather than
+    `streaming`, so the client renders a failure instead of a spinner that never
+    resolves. The *solve itself* surviving its socket is phase 2's worker, not
+    this phase's transport.
+    """
+    session = uuid.uuid4()
+    created_sessions.append(session)
+    url = f"/ws/chat/{session}"
+
+    # One turn that finishes normally, so the replay has something whole in it.
+    with pg_client.websocket_connect(url) as ws:
+        _say_and_settle(ws, "first", "c1")
+
+    # A second turn that will still be running when the socket dies.
+    class SlowResponder:
+        async def respond(self, text: str):
+            await asyncio.sleep(30)
+            yield text  # pragma: no cover - the kill lands first
+
+    app.dependency_overrides[deps.get_responder] = SlowResponder
+
+    with pg_client.websocket_connect(url) as ws:
+        ws.send_json({"type": "user_message", "text": "second", "client_msg_id": "c2"})
+        ack = ws.receive_json()
+        assert ack["type"] == "ack"
+        assert ack["reply_message_id"] is not None  # a turn really did start
+        # Leaving the block kills the socket with that turn in flight.
+
+    app.dependency_overrides.pop(deps.get_responder, None)
+
+    # A new socket, which shares nothing with the dead one but the session id.
+    with pg_client.websocket_connect(url) as ws:
+        replayed = _resume(ws, 0)
+
+    assert [(f["role"], f["status"]) for f in replayed] == [
+        (Role.USER, Status.COMPLETE),
+        (Role.ASSISTANT, Status.COMPLETE),
+        (Role.USER, Status.COMPLETE),
+        (Role.ASSISTANT, Status.FAILED),
+    ]
+    assert [f["seq"] for f in replayed] == [1, 2, 3, 4]
+    # The questions are verbatim, and the finished answer is whole.
+    assert replayed[0]["text"] == "first"
+    assert replayed[1]["text"] == "echo: first "
+    assert replayed[2]["text"] == "second"

@@ -99,19 +99,26 @@ that silently does nothing is indistinguishable, from the client's side, from on
 | `ack` | `client_msg_id`, `seq`, `message_id`, `reply_message_id` | 1b | the message is a durable row at `seq`; `reply_message_id` names the stream |
 | `delta` | `message_id`, `chunk_index`, `text` | 1a | one chunk of an assistant turn |
 | `done` | `message_id`, `seq` | 1b | the turn is complete and its text is final |
+| `message` | `seq`, `message_id`, `role`, `status`, `text` | 1b | one stored message, replayed whole; only `resume` sends it |
 | `error` | `code`, `message`, `retryable` | 1a | application error; the socket stays open |
 | `pong` | — | 1a | |
 | `job_status` | `seq`, `job_id`, `state`, `progress` | 2 | `queued`/`running`/`done`/`failed` |
 
 `delta` carries `(message_id, chunk_index)` rather than a session `seq`, which is what lets several
-turns stream concurrently on one socket without ambiguity — see the open question on sequence spaces.
+turns stream concurrently on one socket without ambiguity. That question — whether deltas need their
+own sequence space — was the one 1a deferred, and `persistence.md` settles it: a delta is not a fact,
+it is a rendering detail of a message still being produced, so only rows get a `seq`. Resume replays
+messages whole rather than re-streaming tokens, which is why a 500-token reply stays two rows and two
+`seq` allocations instead of five hundred of each.
 
 A turn is two rows, so `ack` carries two identities. `message_id` is the user's message, the thing
 being acknowledged; `reply_message_id` is the assistant row `delta` and `done` will name, which is
 what binds the stream to the message that caused it. `reply_message_id` is **absent** when the
-`client_msg_id` was already recorded and no turn for it is running on that connection — a resubmit
-after a reconnect, whose original turn died with the socket that started it. The reply is then a
-completed or failed row, and `resume` is what delivers it.
+`client_msg_id` was already recorded and no turn for it is running *on that connection* — which is
+three situations, not one: the turn already finished there, it died with the socket that started it,
+or it is running on another of this session's sockets. The frame does not distinguish them, because
+the client's next move is the same in all three: stop expecting deltas here, and let `resume` say
+what the row holds.
 
 `error` is a frame, not a close. Closing the socket on a bad user message conflates "this request
 was wrong" with "this connection is unusable", and clients reconnect on close — so a malformed
@@ -154,10 +161,16 @@ already recorded for that session, re-`ack`s the existing message rather than st
 turn. Without it, a reconnect during a submit silently doubles the user's question — and each
 duplicate costs a five-minute solve.
 
-Resume depth is bounded. The server replays at most N frames or the current session's history,
-whichever is smaller; a client that is too far behind gets `{"type":"error","code":"resume_too_old"}`
-and reloads the session over plain HTTP. Unbounded replay turns a week-old tab into a full history
-dump on a single reconnect.
+Resume depth is bounded by `ws_resume_max_messages` (200). A client further behind than that gets
+`{"type":"error","code":"resume_too_old"}` and reloads the session over plain HTTP. Unbounded replay
+turns a week-old tab into a full history dump on a single reconnect, down a socket whose send queue
+is 64 frames deep.
+
+It refuses rather than truncates, and that is the whole point of the error existing. A truncated
+replay hands the client a gap it cannot see: it would advance its cursor past frames it never
+received and never ask for them again. Saying "your cursor is unusable" is the only answer that
+sends it to a full reload instead. The server therefore asks for one row more than the bound, so
+"further behind than we will replay" is answerable from the same query.
 
 ## Fan-out across replicas
 
@@ -312,10 +325,8 @@ Two traps, both hit while writing 1a:
 
 - **Ticket versus cookie** is unresolved and depends on where the phase-5 UI is served from. Ticket
   is the safer default for a separately-hosted frontend.
-- **Whether `delta` frames get their own sequence space.** Persisting one row per token to allocate a
-  `seq` is absurd; the likely answer is that deltas carry `(message_id, chunk_index)` and only the
-  terminal `done` consumes a session `seq`, with resume replaying completed messages whole rather
-  than re-streaming them. Deferred to 1b, where it is testable.
-- **Multi-tab semantics.** Two sockets on one session both receive every frame today. Whether a
-  second tab should be able to submit while a turn is in flight is a product question, not a
-  transport one.
+- **Multi-tab semantics.** Two sockets on one session do *not* both receive every frame: a turn
+  writes to the connection that started it, and `ConnectionRegistry.for_session` has no caller
+  outside tests until the phase-3 fan-out lands. A second tab sees another tab's turn only by
+  reconnecting or resuming. Whether it should be able to submit while a turn is in flight is a
+  product question, not a transport one.

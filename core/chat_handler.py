@@ -27,8 +27,10 @@ from core.frames import (
     Done,
     Error,
     ErrorCode,
+    Message,
     Ping,
     Pong,
+    Resume,
     UserMessage,
 )
 from core.repository import ChatRepository, StoredMessage
@@ -69,8 +71,9 @@ class ConnectionHandler:
         """Run the reader and the writer until either stops, then close once."""
         try:
             # Before either task starts: every message stored below allocates
-            # its seq from this row, so a turn that ran ahead of it would fail
-            # on a foreign key rather than on anything legible.
+            # its seq from this session's row, so a turn that ran ahead of it
+            # dies in the allocator — `no such chat session`, from a write the
+            # client was told would be durable.
             await self._repo.ensure_session(self._conn.session_id)
         except Exception:
             log.exception("could not open session (session=%s)", self._conn.session_id)
@@ -138,8 +141,8 @@ class ConnectionHandler:
             frame = CLIENT_FRAME_ADAPTER.validate_json(raw)
         except ValidationError as exc:
             # An error frame, not a close: the connection is fine, this one message
-            # was not. An unimplemented type (cancel, resume) lands here too, which
-            # is the truthful answer until the phase that implements it.
+            # was not. An unimplemented type (cancel) lands here too, which is the
+            # truthful answer until the phase that implements it.
             self._conn.send(
                 Error(
                     code=ErrorCode.BAD_FRAME,
@@ -161,6 +164,25 @@ class ConnectionHandler:
 
         if isinstance(frame, Ping):
             self._conn.send(Pong())
+            return
+
+        if isinstance(frame, Resume):
+            # Ahead of the turn cap deliberately: replaying history starts no
+            # turn, and a client that reconnected mid-solve is both the most
+            # likely to be at the cap and the most in need of the frames it
+            # missed. Refusing it there would deny history to exactly the
+            # session that lost some.
+            try:
+                await self._resume(frame)
+            except Exception:  # noqa: BLE001 - a database blip must not kill the socket
+                log.exception("could not resume (session=%s)", self._conn.session_id)
+                self._conn.send(
+                    Error(
+                        code=ErrorCode.INTERNAL,
+                        message="the session could not be replayed",
+                        retryable=True,
+                    )
+                )
             return
 
         if len(self._turns) >= self._settings.ws_max_concurrent_turns:
@@ -186,6 +208,43 @@ class ConnectionHandler:
                     code=ErrorCode.INTERNAL,
                     message="the message was not stored",
                     retryable=True,
+                )
+            )
+
+    async def _resume(self, frame: Resume) -> None:
+        """Replay what this session recorded after `last_seq`.
+
+        Whole messages, not token streams: the accumulated text reaches the same
+        rendered state as re-streaming would, in one frame instead of one per
+        chunk. Rows come back in `seq` order, so the client applies them by
+        appending and its cursor advances monotonically.
+        """
+        limit = self._settings.ws_resume_max_messages
+        # One past the bound, so "further behind than we will replay" is
+        # answerable from this query rather than from a second count(*).
+        missed = await self._repo.messages_since(self._conn.session_id, frame.last_seq, limit + 1)
+
+        if len(missed) > limit:
+            # Truncating instead would hand the client a gap it cannot see: it
+            # would advance its cursor past frames it never received and never
+            # ask for them again. Better to say the cursor is unusable.
+            self._conn.send(
+                Error(
+                    code=ErrorCode.RESUME_TOO_OLD,
+                    message=f"more than {limit} messages since seq {frame.last_seq}",
+                    retryable=False,
+                )
+            )
+            return
+
+        for stored in missed:
+            self._conn.send(
+                Message(
+                    seq=stored.seq,
+                    message_id=stored.message_id.hex,
+                    role=stored.role,
+                    status=stored.status,
+                    text=stored.text,
                 )
             )
 

@@ -8,8 +8,8 @@ Nothing here knows how a frame reaches a socket (`core/ws.py`), which frame
 answers which (`core/chat_handler.py`), or what fills a reply
 (`core/responder.py`). Those depend on this module; it depends on none of them.
 
-Only the frames phase 1a actually honors are defined. `resume` (1b), `cancel`
-and `job_status` (2) are specified in docs/websocket.md but deliberately absent
+Only the frames the server actually honors are defined. `cancel` and
+`job_status` (2) are specified in docs/websocket.md but deliberately absent
 here: a `cancel` that parses and silently does nothing is indistinguishable,
 from the client's side, from one that worked. An unknown `type` is rejected as
 a bad frame, which is a truthful answer until the phase that implements it.
@@ -19,6 +19,12 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+
+# Role and Status are spelled once, in the persistence seam, and reused on the
+# wire rather than restated here — the same "one list, not two" the tables
+# module follows. `message` replays a stored row, so its vocabulary is the
+# row's; inventing a parallel set of strings is how the two drift.
+from core.repository import Role, Status
 
 # Bumped only for breaking changes. It rides on every frame from the first
 # commit because retrofitting a version field requires a flag day: there is no
@@ -39,6 +45,7 @@ class ErrorCode(StrEnum):
     TOO_MANY_CONNECTIONS = "too_many_connections"
     GOING_AWAY = "going_away"
     INTERNAL = "internal"
+    RESUME_TOO_OLD = "resume_too_old"
 
 
 # --------------------------------------------------------------------------
@@ -68,7 +75,27 @@ class Ping(_ClientFrame):
     type: Literal["ping"]
 
 
-ClientFrame = Annotated[UserMessage | Ping, Field(discriminator="type")]
+class Resume(_ClientFrame):
+    """Everything this session recorded after `last_seq`, please.
+
+    Sent immediately after reconnect, before anything else: the client cannot
+    know whether the frames it missed matter until it has them, and a message
+    submitted first would interleave its ack into the replay.
+
+    `last_seq` is the highest `seq` the client has applied, so the reply starts
+    at `last_seq + 1`. Zero is the honest opening bid from a client with no
+    history — a fresh tab, or one that dropped its state — and asks for the
+    session from the beginning.
+    """
+
+    type: Literal["resume"]
+    # Not negative: `seq` starts at 1, so 0 already means "I have nothing".
+    # A negative cursor could only be a client bug, and silently widening the
+    # range for it would hide that.
+    last_seq: int = Field(ge=0)
+
+
+ClientFrame = Annotated[UserMessage | Ping | Resume, Field(discriminator="type")]
 
 # Built once at import. TypeAdapter compiles a validator; constructing one per
 # frame would put that cost on every inbound message.
@@ -93,9 +120,11 @@ class Ack(_ServerFrame):
     client bind the stream to the bubble it drew before either row existed.
 
     `reply_message_id` is absent when the key was already recorded and no turn
-    for it is running on this connection — a resubmit after a reconnect. There
-    is no live stream to name: the original turn died with the socket that
-    started it, and the row it left behind is what resume delivers.
+    for it is running *on this connection* — which covers three situations, not
+    one: the turn finished here already, it died with the socket that started
+    it, or it is running on another of this session's sockets. The frame does
+    not distinguish them, because the client's next move is the same in all
+    three: stop waiting for deltas here and ask `resume` what the row says.
     """
 
     type: Literal["ack"] = "ack"
@@ -151,4 +180,26 @@ class Pong(_ServerFrame):
     type: Literal["pong"] = "pong"
 
 
-ServerFrame = Ack | Delta | Done | Error | Pong
+class Message(_ServerFrame):
+    """One stored message, replayed whole. Only resume sends this.
+
+    Replay hands over accumulated text rather than re-streaming tokens: the
+    client renders by appending, so one frame reaches the same end state as four
+    hundred deltas would, and a 500-token reply stays 2 rows and 2 `seq`
+    allocations instead of 500 of each.
+
+    `status` is on the wire because a replayed assistant row is not always
+    finished. A reply whose socket died mid-turn comes back `failed`, and a
+    client that assumed every replayed row was `complete` would render a
+    truncated answer as though the model had meant to stop there.
+    """
+
+    type: Literal["message"] = "message"
+    seq: int
+    message_id: str
+    role: Role
+    status: Status
+    text: str
+
+
+ServerFrame = Ack | Delta | Done | Error | Pong | Message
