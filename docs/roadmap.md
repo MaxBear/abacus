@@ -18,8 +18,8 @@ rather than invented. See [Open questions](#open-questions) — two of them affe
 | phase | what | state |
 | --- | --- | --- |
 | 0 | Skeleton: FastAPI + Postgres + RabbitMQ, health split, prod-shaped image | **done** |
-| 1 | Chat over WebSocket | in progress |
-| 2 | The job broker, built twice and benchmarked | planned |
+| 1 | Chat over WebSocket | **done** |
+| 2 | The job broker, built twice and benchmarked | in progress |
 | 3 | Containerized workers | planned |
 | 4 | The analytics engine, and the LLM gateway | planned, numbering unresolved |
 | 5 | Chat UI | planned |
@@ -49,7 +49,13 @@ requests. `tests/test_health.py` is the regression guard for the first.
 
 ## Phase 1 — chat over WebSocket
 
-In progress. **Transport design is settled** in [`websocket.md`](websocket.md), written ahead of the
+**Done**, functionally, at `34654ca`. 1a and 1b are merged, the postgres-marked suite passes against
+a real database — including `test_a_socket_killed_mid_turn_loses_nothing`, the acceptance test — and
+the browser pass over `dev/chat.html` on 2026-08-20 confirmed the happy path, full replay, and the
+caught-up resume that correctly returns nothing. What that pass found was a defect in the harness
+rather than the server; see `dev/chat.html`'s note on `client_msg_id`.
+
+**Transport design is settled** in [`websocket.md`](websocket.md), written ahead of the
 code and holding through phase 6; this section is the summary, that document is authoritative.
 
 Split in two, because persistence is a different concern from transport and phase 0's habit is one
@@ -76,6 +82,10 @@ underneath them.
 
 ## Phase 2 — the job broker, built twice
 
+In progress. **The contract, the lease semantics, and the benchmark methodology are settled** in
+[`jobs.md`](jobs.md), written ahead of either implementation; this section is the summary, that
+document is authoritative.
+
 The centerpiece. It is the only phase the README's roadmap line emphasizes, and the reason the
 project describes itself as a cloud-to-scheduler bridge.
 
@@ -94,11 +104,12 @@ dual-write, no outbox. Against that, RabbitMQ brings real delivery semantics and
 connection-pool slots. Jobs here are 30 seconds to five minutes and low-rate, which is exactly the
 regime where the folklore is least likely to apply. Building both and measuring is the point.
 
-> **Open.** The benchmark's methodology is not recoverable from the repo — what is measured
-> (enqueue-to-start latency? throughput? behavior under worker crash and redelivery?), at what
-> concurrency, and what result would actually change the decision. Worth pinning down before writing
-> either implementation, since a benchmark designed after the fact tends to confirm whatever was
-> built first.
+**Settled: the benchmark's methodology**, in [`jobs.md`](jobs.md#the-benchmark), before either
+implementation exists — since a benchmark designed after the fact confirms whatever was built first.
+The framing that makes it decision-shaped: at 30-second-to-five-minute jobs, throughput is not the
+binding constraint, so what is measured is enqueue-to-reserve latency, the database's cost while
+*idle*, time-to-redelivery after a hard kill, and the consumer count at which p99 knees. The
+thresholds that would flip the recommendation are written down in advance.
 
 ## Phase 3 — containerized workers
 
@@ -145,6 +156,28 @@ under pressure — specifically what happens when the model requests an analysis
 but meaningless for the supplied portfolio. Validation belongs somewhere, and the tempting answer
 (let the model check) is the one that ends the separation this project is built to demonstrate.
 
+> **Open — who calls `JobQueue.enqueue`.** Not settled anywhere in the repo, and it is the seam most
+> likely to make 4b's "the stub swap changes no frame" promise false. A gateway that enqueues needs
+> the session id, because jobs deduplicate on `(session_id, idempotency_key)` and `job_status` has to
+> route back to a session — and `core/responder.py` deliberately withholds exactly that: *"A
+> responder is handed text and yields text; it never sees a Connection, a session id, or a frame."*
+>
+> Three ways out, none free. The gateway holds its own `JobQueue`, which breaks that narrowness and
+> means the gateway can no longer be tested without a queue. Or `Responder` stops being `text →
+> text` and yields a small discriminated union — a text chunk, or an analysis to run — leaving
+> `enqueue` to the handler. Or the handler inspects the gateway's output, which is the same thing
+> typed differently.
+>
+> **Leaning to the second.** It keeps the gateway a pure function of text → intent, testable with no
+> queue and no database, and it puts `enqueue` next to the code that already owns session state:
+> `_handle_user_message` allocates the `seq`, writes the rows, and knows the session id. It is also
+> the honest description of a gateway, which genuinely produces two kinds of output — prose for the
+> human and a request for the machine — and calling both "text" is what forces the awkwardness.
+>
+> Nothing in phase 2 depends on this: the Protocol and the `jobs` table are identical either way, and
+> only the holder of the reference changes. But phase 4's whole premise is that the swap is cheap,
+> which is only true if this is decided before the gateway is written rather than during it.
+
 ## Phase 5 — chat UI
 
 **What lands.** The frontend: paste a portfolio, ask in English, watch tokens and job progress
@@ -189,8 +222,10 @@ rest can wait for the phase that needs them.
 
 1. **Phase 4's numbering** — analytics engine and LLM gateway currently share the number. Split into
    4a/4b, or renumber 5 and 6 upward?
-2. **Phase 2's benchmark methodology** — what is measured, at what concurrency, and what result would
-   change the decision. Best settled before either implementation is written.
+2. ~~**Phase 2's benchmark methodology**~~ — settled in [`jobs.md`](jobs.md#the-benchmark). What
+   replaced it are narrower phase-2 questions, listed in that document's Open section: whether phase
+   2 lands a real `worker/` or only a harness consumer, quorum versus classic queues, and whether a
+   lease duration is per-call or per-queue.
 3. **Where the phase-5 UI is served from** — decides cookie versus ticket for WebSocket auth, which
    `websocket.md` is holding open.
 4. **Whether `verify-phase0.sh` generalizes** to `verify.sh <phase>` once phase 1 has acceptance

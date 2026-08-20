@@ -14,12 +14,14 @@ from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
     Identity,
     Index,
+    Integer,
     MetaData,
     Table,
     Text,
@@ -28,7 +30,9 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
+from core.jobs import JobState
 from core.repository import Role, Status
 
 # Explicit constraint naming, set before any table is defined.
@@ -132,4 +136,120 @@ Index(
     chat_messages.c.client_msg_id,
     unique=True,
     postgresql_where=chat_messages.c.client_msg_id.isnot(None),
+)
+
+
+jobs = Table(
+    "jobs",
+    metadata,
+    # The wire identity, and the physical key. Unlike chat_messages this table
+    # has no surrogate: a job is addressed by uuid from the moment it is created
+    # — a client watches one, a worker leases one — so a second identity would
+    # be a column nothing ever reads. The index fragmentation that argument
+    # avoided there is not a concern here: jobs are minutes apart, not tokens.
+    Column("id", Uuid(), primary_key=True),
+    # Nullable, because a job need not have come from a conversation — a
+    # scheduled backfill has none — and because the queue must not require the
+    # chat schema to be useful. CASCADE matches chat_messages: deleting a
+    # session takes its jobs with it.
+    Column(
+        "session_id",
+        Uuid(),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+    ),
+    # The caller's deduplication key. `client_msg_id`'s counterpart, and NOT
+    # NULL unlike it: every job has one, defaulted client-side to a fresh uuid,
+    # so there is no partial-index trick to play here.
+    Column("idempotency_key", Text, nullable=False),
+    # Which analysis, and its AnalysisRequest. Both opaque to the queue, which
+    # is what keeps this table reusable for work unrelated to analytics.
+    Column("kind", Text, nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column("state", Text, nullable=False, server_default=text(f"'{JobState.QUEUED}'")),
+    Column("attempts", Integer, nullable=False, server_default=text("0")),
+    Column("max_attempts", Integer, nullable=False, server_default=text("3")),
+    # Backoff, and the only scheduling mechanism this queue has. A job is
+    # invisible to `reserve` until now() passes it, which is how `nack(retry_in)`
+    # holds a failure back without a timer anywhere in the application.
+    Column("run_after", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # RabbitMQ only: set after basic_publish returns. Null on a committed job
+    # means the publish never happened, which is the one dual-write failure that
+    # can actually lose work — see docs/jobs.md. The Postgres implementation
+    # never reads or writes it: its insert *is* the publish.
+    Column("published_at", DateTime(timezone=True)),
+    # The fencing token, new on every reservation. A consumer that stalls past
+    # its deadline and wakes after another has claimed the job presents a token
+    # the row no longer holds, and its ack is refused instead of overwriting a
+    # result someone else recorded.
+    Column("lease_id", Uuid()),
+    # The lease is a timestamp, never a held lock: nothing is blocked while a
+    # consumer works, and the claim lapses on its own if that consumer dies.
+    # That is what lets a five-minute solve outlive the process running it.
+    Column("lease_expires_at", DateTime(timezone=True)),
+    # Observability only. Correctness rests on lease_id, never on this.
+    Column("lease_owner", Text),
+    # Asked for from outside; noticed by the consumer between units of work.
+    # Nothing here can stop a process already inside a computation.
+    Column("cancel_requested", Boolean, nullable=False, server_default=text("false")),
+    # The object-storage key. Phase 3 sets it; until then nothing does.
+    Column("result_ref", Text),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # Same reasoning as chat_messages: text plus a check, so adding a state is a
+    # constraint change rather than a type migration — and the same trap, that
+    # autogenerate cannot see a CHECK change and will emit an empty migration.
+    CheckConstraint(f"state in ({_quoted(JobState)})", name="state"),
+    # A lease is all-or-nothing. Half of one — an id with no deadline — would
+    # let `reserve` treat a live claim as expired, or never expire a dead one.
+    CheckConstraint(
+        "(lease_id is null) = (lease_expires_at is null)",
+        name="lease_is_whole",
+    ),
+    CheckConstraint("attempts >= 0 and max_attempts > 0", name="attempts_sane"),
+    # The idempotency key, scoped to the session. Two clients that both call
+    # their message "1" are not submitting the same job.
+    #
+    # NULLS NOT DISTINCT because session_id is nullable and the default would
+    # make every session-less job unique regardless of its key — silently
+    # disabling deduplication for exactly the callers (backfills, retries from
+    # a script) most likely to submit the same work twice.
+    UniqueConstraint(
+        "session_id",
+        "idempotency_key",
+        name="uq_jobs_session_id_idempotency_key",
+        postgresql_nulls_not_distinct=True,
+    ),
+)
+
+# The claim query's index: equality on the state, then the columns it orders by.
+# Partial, because `reserve` looks only at work that is waiting — a table that
+# is mostly finished jobs should not carry them here. `failed` is included
+# because a job awaiting retry is reservable once its run_after passes; `running`
+# is not, since an expired lease is found by the second index below.
+Index(
+    "ix_jobs_reservable",
+    jobs.c.run_after,
+    jobs.c.created_at,
+    postgresql_where=jobs.c.state.in_([JobState.QUEUED, JobState.FAILED]),
+)
+
+# Expiry is a predicate, not a sweeper (docs/jobs.md), so the claim query also
+# scans for lapsed leases. Separate and partial rather than folded into the
+# index above: the two halves have disjoint predicates and different sort keys,
+# and one combined index would serve neither.
+Index(
+    "ix_jobs_expired_leases",
+    jobs.c.lease_expires_at,
+    postgresql_where=jobs.c.state == JobState.RUNNING,
+)
+
+# The orphan sweep: jobs committed but never published. Tiny — it holds only the
+# rows currently in flight between the insert and the publish, which is normally
+# none of them. That is precisely why it is worth having: the query runs on a
+# timer forever and should touch nothing.
+Index(
+    "ix_jobs_unpublished",
+    jobs.c.created_at,
+    postgresql_where=jobs.c.published_at.is_(None),
 )

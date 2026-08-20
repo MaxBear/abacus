@@ -1,0 +1,506 @@
+# Phase 2 — the job broker, built twice
+
+Draft, and design-first for the same reason [`websocket.md`](websocket.md) was: the point of this
+phase is a *comparison*, and a benchmark designed after the fact confirms whatever was built first.
+[`roadmap.md`](roadmap.md) says as much in its own open question. So the contract, the semantics, and
+the measurement are settled here before either implementation exists.
+
+The phase's question, in one line: **when is a database a sufficient queue, and when is it not?**
+The received answer — "never use your database as a queue" — is repeated far more often than it is
+measured. `SELECT … FOR UPDATE SKIP LOCKED` is genuinely good and buys transactional enqueue with
+the job's own state. RabbitMQ buys real delivery semantics and does not spend connection-pool slots.
+Jobs here run 30 seconds to five minutes at a low rate, which is precisely the regime where the
+folklore is least likely to apply.
+
+Building both and measuring is the deliverable. **Two implementations, one Protocol, one suite run
+twice** — that both pass unmodified *is* the proof the seam is real.
+
+## What a queue is here: pull, with a lease
+
+The shape is not an implementation detail; it is the thing being built. A consumer **asks** for work,
+holds it under a **lease** with a deadline, **extends** the lease while it is still working, and
+**acknowledges** or **releases** at the end. Leases, visibility timeouts, competing consumers,
+backpressure — that vocabulary is the phase.
+
+```
+reserve()  ──▶  job, leased until T
+                  │  worker solves (30s … 5min)
+                  ├── extend()   … pushes T out, repeatedly
+                  ├── ack()      … terminal success, the job is gone from the queue
+                  └── nack()     … terminal failure or a voluntary release
+                  ✗  crash       … lease expires at T, job returns to the queue
+```
+
+Nothing about that requires polling *as an interface*. `reserve(wait_for=…)` is allowed to block, and
+each implementation decides how it waits — which is one of the things worth measuring, not
+specifying.
+
+**Why pull and not push.** RabbitMQ's native shape is push: the broker hands deliveries to a consumer
+up to its prefetch window. Postgres' native shape is pull. A pull-shaped Protocol is implementable on
+both — the RabbitMQ adapter runs a background consumer at `prefetch_count=1` and feeds an internal
+`asyncio.Queue` that `reserve()` reads — whereas a push-shaped Protocol forces the Postgres adapter to
+invent a dispatcher loop and hide it behind a callback, which is the same polling with less of it
+visible. Pull also keeps the interesting property explicit: **a worker takes work only when it has
+capacity**, which is what makes backpressure a consequence of the design rather than a feature bolted
+onto it.
+
+`prefetch_count=1` is not incidental. With a larger window RabbitMQ hands a consumer several
+five-minute jobs at once; they sit in that consumer's buffer while other consumers idle, and if it
+dies they all wait for the channel to close. One in flight per consumer is what makes the two
+implementations comparable at all.
+
+## `jobs` is the system of record, in both worlds
+
+Both implementations write the same table. The queue moves a job *id*; the job's state lives in
+Postgres either way.
+
+That is not a neutral choice, and it is worth being honest about what it costs each side:
+
+- **Postgres wins by construction.** The row *is* the queue entry. Enqueue is one transaction —
+  create the job and make it visible in the same commit as whatever caused it. No dual write, no
+  outbox, no window where a job exists but is invisible or vice versa.
+- **RabbitMQ pays for it.** `insert into jobs` and `basic_publish` are two systems with no
+  transaction spanning them, so the enqueue path is a **dual write** — and repairing it costs a
+  column and a sweeper that Postgres needs neither of. **That asymmetry is the finding**, and it is
+  the most concrete answer this phase can give to "what does the database actually buy you." It is
+  repaired below rather than hidden: the repair is small, and naming what it cost is the point.
+
+The alternative — let each implementation own its own state entirely — was considered and rejected.
+Phase 2 owes `job_status` frames to the WebSocket layer and phase 5 owes a UI that can ask "what
+happened to my job?"; RabbitMQ cannot answer that question about a message it has already delivered,
+so there would have to be a table anyway. Better one table both use than a table that appears only
+on one side of the comparison.
+
+### Schema (proposed)
+
+```sql
+create type … -- no: text plus a check, as in chat_messages, for the same reason
+
+create table jobs (
+  id             uuid primary key,          -- the wire identity, client-visible
+  session_id     uuid references chat_sessions(id) on delete cascade,
+  idempotency_key text not null,            -- see below
+  kind           text        not null,      -- which analysis; opaque to the queue
+  payload        jsonb       not null,      -- the AnalysisRequest, opaque to the queue
+  state          text        not null,      -- queued | running | done | failed | dead | cancelled
+  cancel_requested bool      not null default false,  -- polled by the consumer; see "What the socket sees"
+  attempts       int         not null default 0,
+  max_attempts   int         not null default 3,
+  run_after      timestamptz not null default now(),   -- backoff, and the only "scheduled" mechanism
+  published_at   timestamptz,              -- RabbitMQ only: set after basic_publish returns
+  lease_id       uuid,                      -- the fencing token; new on every reservation
+  lease_expires_at timestamptz,             -- null unless state = running
+  lease_owner    text,                      -- consumer identity, for observability not correctness
+  result_ref     text,                      -- object-storage key (phase 3); null until then
+  error          text,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
+);
+
+create unique index uq_jobs_session_id_idempotency_key on jobs (session_id, idempotency_key);
+
+-- The reserve index. Equality on state, then the two range columns the claim
+-- query orders and filters by.
+create index ix_jobs_reservable on jobs (state, run_after, created_at)
+  where state = 'queued';
+```
+
+`lease_id` is a **fencing token**, and it is the reason `lease_owner` is explicitly not one. A
+consumer that stalls past its deadline, has its job claimed elsewhere, and then wakes up and `ack`s
+would otherwise overwrite a result another consumer already recorded. Every write that ends a lease
+carries the token and matches on it; a token the row no longer holds raises `StaleLease` instead.
+Fencing is on the token alone and not on the deadline — an expired lease nobody has taken is still
+its holder's, because the only thing the check must prevent is *two* writers, and failing an
+unclaimed late lease would add a clock-skew race that protects nothing.
+
+`idempotency_key` is `client_msg_id`'s counterpart and exists for the same reason: a reconnecting
+client that is unsure whether its submit landed retries, and a duplicate here costs a five-minute
+solve. Phase 1b already established the habit — the unique index does the deduplicating, not a
+check-then-insert.
+
+`state` is text plus a check constraint rather than a Postgres enum, matching `chat_messages`: adding
+a state later is then a constraint change instead of a type migration. The same trap applies — Alembic
+autogenerate cannot see a CHECK change, so editing the enum produces an empty migration.
+
+### The dual write, and the smallest thing that repairs it
+
+The RabbitMQ enqueue writes to two systems that cannot agree:
+
+```
+INSERT INTO jobs (...); COMMIT;    -- system 1
+basic_publish(job_id)              -- system 2
+```
+
+There is no two-phase commit between them, and publisher confirms do not help — a confirm still is
+not atomic with a Postgres commit. Three things can go wrong, and **only one of them matters**:
+
+| failure | consequence | why |
+| --- | --- | --- |
+| published twice | harmless | two consumers race to claim; the state transition is a conditional `update`, so one wins and the loser discards |
+| published before the insert | does not arise | the insert goes first, always |
+| **inserted, never published** | **the job sits at `queued` forever** | nothing holds the intent to publish, so nothing ever retries it |
+
+The third is silent, permanent, and indistinguishable from a job legitimately waiting for a busy
+consumer. It is worth fixing. The other two are not worth a line of code.
+
+**The fix is one nullable column and a sweep**, both listed in the schema above:
+
+```
+INSERT INTO jobs (...); COMMIT;                       -- published_at is null
+basic_publish(job_id)
+UPDATE jobs SET published_at = now() WHERE id = $1;
+
+-- every 30s, from the API's lifespan:
+select id from jobs
+ where state = 'queued' and published_at is null
+   and created_at < now() - interval '2 minutes'
+   for update skip locked;
+```
+
+The column is what makes "orphan" *exact*. Without it the sweep can only ask "has this been queued a
+long time?", which a job waiting behind four busy workers answers identically — and republishing
+healthy jobs on a timer is a worse system than the one being repaired.
+
+**This is an outbox wearing a smaller hat**, and the resemblance is the interesting part. A textbook
+transactional outbox writes the intent-to-publish into its own table inside the job's transaction,
+and a relay process drains it. Here the intent *is* `published_at is null` on a row that already
+exists, because the message payload is nothing but the job id — so there is no second table, and the
+relay is a periodic query rather than a process to deploy. Several API replicas sweeping at once
+needs no leader election either, since a duplicate publish is the harmless failure.
+
+And then notice what the sweep is: `for update skip locked` over a Postgres table. **Making RabbitMQ
+safe requires building a small Postgres queue next to it.** That sentence is the phase's thesis
+stated as an artifact rather than an opinion, which is why the repair is in the design rather than
+left as a caveat in the report.
+
+### The claim query
+
+```sql
+update jobs set
+    state = 'running',
+    attempts = attempts + 1,
+    lease_expires_at = now() + $lease,
+    lease_owner = $owner,
+    updated_at = now()
+where id = (
+    select id from jobs
+    where state = 'queued' and run_after <= now()
+    order by run_after, created_at
+    for update skip locked
+    limit 1
+)
+returning *;
+```
+
+The lock is held for the duration of one short update and released at commit — never across a solve.
+A lease is a *timestamp in a row*, not a held lock; that is what lets the job survive the death of the
+process that claimed it, and what makes the reaper below possible.
+
+### Expiry is a query, not a daemon
+
+A job whose `lease_expires_at` has passed is reservable. Rather than run a sweeper that flips rows
+back to `queued`, the claim query's predicate becomes:
+
+```sql
+-- what is reservable, stated as one predicate. NOT how to query it — see below.
+where (state in ('queued', 'failed') and run_after <= now())
+   or (state = 'running' and lease_expires_at < now() and attempts < max_attempts)
+```
+
+No background process, nothing to deploy, nothing to fail silently, and no window between expiry and
+recovery.
+
+**That predicate is the specification, and it must not be the query.** Written as a single `OR`,
+Postgres cannot use either partial index to satisfy the `order by`, so it `BitmapOr`s the two, scans
+every matching row, and sorts them — to return one. Measured on a 50k-row table with ~8k rows
+matching, on the compose stack:
+
+| form | plan | time |
+| --- | --- | --- |
+| one query, `OR` | BitmapOr → Bitmap Heap Scan (7,992 rows) → quicksort 692 kB | **3.776 ms** |
+| reservable branch alone | Index Scan on `ix_jobs_reservable`, one row | **0.047 ms** |
+| expired branch alone | Index Scan on `ix_jobs_expired_leases`, one row | **0.057 ms** |
+| expired branch, none pending | Index Scan, zero rows | **~0.03 ms** |
+
+Eighty times, and the gap widens with queue depth rather than staying put: the `OR` form's cost is
+proportional to how much work is waiting, which is exactly backwards for a queue.
+
+`UNION ALL` does not rescue it — `FOR UPDATE` is not permitted with `UNION`, so the two branches
+cannot be combined and still take locks. **So `reserve` issues two statements, expired leases first.**
+Expired first rather than second because a steady supply of new work would otherwise starve
+reclamation indefinitely, and a job that has already been attempted has more invested in it than one
+that has not. The cost of that ordering is one index scan returning zero rows in the common case,
+which is the cheapest query in this document.
+
+**Note the attempts bound on the second branch.** Reclaiming a lapsed lease *is* a retry, so it has
+to respect `max_attempts` — and enforcing that only in `nack` leaves the worst case uncovered, since
+it is precisely the *crashing* consumer that never calls `nack`. A job that reliably kills whatever
+picks it up would otherwise be redelivered forever, occupying a consumer every time, with `attempts`
+running past `max_attempts` and nothing anywhere noticing.
+
+Excluding those rows is not enough on its own: left at `running` they would be invisible, which is
+the same failure the `streaming` row was in phase 1b — a state a reader cannot tell from healthy. So
+the claim path retires them on contact, in the same statement that does the reclaiming:
+
+```sql
+update jobs set state = 'dead',
+                error = coalesce(error, 'lease expired with no attempts remaining')
+ where state = 'running' and lease_expires_at < now() and attempts >= max_attempts;
+```
+
+This is what `x-delivery-limit` gives for free on quorum queues, and it is the clearest single case
+where that choice earns its place in the comparison.
+
+## The contract, and where the two disagree
+
+```python
+class JobQueue(Protocol):
+    async def enqueue(self, request: JobRequest) -> Job: ...
+    async def reserve(self, *, owner: str, lease: timedelta,
+                      wait_for: timedelta) -> Lease | None: ...
+    async def extend(self, lease: Lease, by: timedelta) -> Lease: ...
+    async def ack(self, lease: Lease, *, result_ref: str | None = None) -> None: ...
+    async def nack(self, lease: Lease, *, error: str, retry_in: timedelta | None) -> None: ...
+    async def get(self, job_id: UUID) -> Job | None: ...
+```
+
+**Settled: `lease` is a per-call argument, not queue configuration.** Queue-level is the *weaker*
+option, not the more advanced one — one duration configured once, applied to every job, so a
+30-second job and a five-minute job get the same deadline and the queue is tuned for the worst of
+them. Per-call costs nothing extra: in Postgres it is a parameter in an `update`, and in RabbitMQ
+neither form is honored anyway. Making it an argument keeps the fact that job kinds have different
+durations visible at the call site, which is where the caller already knows it.
+
+The asymmetries, stated rather than smoothed over — this table is half the phase's answer:
+
+| concern | Postgres | RabbitMQ |
+| --- | --- | --- |
+| enqueue atomicity | one transaction with the caller's own writes | dual write; needs `published_at` + a sweep |
+| lease | a timestamp; survives process death; expiry is a predicate | unacked-until-channel-closes; **no per-message deadline** |
+| `extend` | an update; real | **no equivalent** — the honest mapping is a no-op that touches only the row |
+| a wedged consumer | lease expires, another consumer claims it | `consumer_timeout` (default 30 min) kills the *channel*; blunt |
+| delayed retry / backoff | `run_after` in the future | needs the delayed-exchange plugin, or a DLX+TTL parking queue |
+| poison messages | `attempts` column | `x-delivery-limit`, since these are quorum queues |
+| waiting for work | poll, or `LISTEN`/`NOTIFY` | the broker pushes; no wait loop at all |
+| cost while idle | a query per consumer per interval | one sweep query per API replica per interval |
+| connection cost | a pool slot per consumer | an AMQP channel, cheap |
+
+Two rows there deserve emphasis because they are where the folklore inverts.
+
+**`extend` has no RabbitMQ implementation.** A five-minute solve that needs seven minutes has no way
+to tell the broker so. The Postgres side extends a lease and continues; the RabbitMQ side relies on
+the channel simply staying open, which means a *hung* consumer holds a job indefinitely and a *slow*
+consumer is safe — the opposite of what a visibility timeout gives you. `consumer_timeout` is the
+only lever and it operates on the channel, taking every other delivery on it down too.
+
+**Settled: quorum queues, not classic.** Quorum is RabbitMQ's modern default and brings
+`x-delivery-limit`, so poison-message handling is the broker's rather than a column's — which is the
+comparison worth having. Most "we compared them" writeups quietly used classic queues on one node,
+and a comparison against the weaker option is not a comparison. The report says which was used.
+
+**Backoff pulls RabbitMQ back toward the table.** Retrying a failed job in 30 seconds is one column
+update in Postgres and a plugin or a parking-queue trick in RabbitMQ. Since `jobs` already exists,
+the tempting shortcut is for the RabbitMQ adapter to set `run_after` and then… have something poll
+for it. At which point it is a Postgres queue with an extra dependency. **The honest RabbitMQ
+implementation republishes with a DLX+TTL parking queue** and takes the complexity on the chin,
+because the shortcut would quietly convert the comparison into a comparison of Postgres with itself.
+
+> **Open — `nack(retry_in=…)` semantics on RabbitMQ.** DLX+TTL gives per-queue TTL, so per-job
+> backoff needs either a small ladder of parking queues (30s / 5m / 30m) or message-level TTL, which
+> has a documented head-of-line blocking hazard. The ladder is the recommendation; it is also an
+> admission that this is harder than the column.
+
+## Waiting: poll, or `LISTEN`/`NOTIFY`?
+
+The Postgres implementation has to decide how `reserve(wait_for=…)` waits, and it changes what the
+benchmark measures.
+
+- **Poll on an interval.** One indexed query per consumer per tick. Simple, obvious, and the thing
+  everyone assumes is expensive. At 16 consumers on a 1-second tick that is 16 queries a second — of
+  a partial-index lookup returning zero rows.
+- **`LISTEN`/`NOTIFY` to wake.** Near-zero idle cost and near-zero latency, at the price of a
+  dedicated connection per consumer held open forever, plus a poll fallback anyway, because a
+  `NOTIFY` delivered while a listener was reconnecting is simply lost and `run_after` jobs have no
+  `NOTIFY` to deliver.
+
+**Recommendation: build the polling implementation, and make the poll interval the benchmark's
+independent variable.** "How much does idle polling actually cost?" is the question the folklore
+answers loudest and measures least. `LISTEN`/`NOTIFY` is then a documented, measured improvement if
+the numbers say latency matters — and if they do not, that null result is worth more than the
+optimization.
+
+## The benchmark
+
+`roadmap.md`'s second open question, answered. The framing that makes it decision-shaped:
+
+> **At 30-second-to-five-minute jobs, throughput is not the binding constraint. The cost of *waiting*
+> is.** A queue that dequeues 10,000 jobs/sec is irrelevant when the workers can start twelve of them
+> a minute. What matters is what the queue costs while nothing is happening, how fast a job starts
+> once submitted, and how long a crashed job stays lost.
+
+### What is measured
+
+| metric | why it can change the decision |
+| --- | --- |
+| **enqueue→reserve latency**, p50/p99 | the user-visible number: how long "queued" is on screen |
+| **steady-state DB cost while idle** — queries/sec, backend CPU %, pool slots held | the actual charge for using the database as a queue — **measured on both sides**, since the RabbitMQ implementation's orphan sweep is itself a periodic query |
+| **time-to-redelivery after SIGKILL** mid-job | the lease model's whole reason to exist; Postgres is the lease, RabbitMQ is the channel |
+| **duplicate execution count** under crash+redelivery | at-least-once is fine; twice-*often* is not |
+| **saturation point** — consumers at which p99 latency knees | where the answer flips, which is the deliverable |
+
+Not measured, deliberately: peak enqueue throughput. It is the number everyone quotes and the one
+this workload will never reach.
+
+### How
+
+**Settled: the consumer is a mock worker, not `worker/`.** It stands in the same relation to the
+phase-3 worker that `StubResponder` does to the phase-4 gateway — a real implementation of the real
+interface that computes nothing interesting, so the contract around it can be exercised before the
+expensive thing exists. `worker/` stays empty until phase 3, and the mock is deliberately throwaway.
+
+Synthetic jobs, therefore — a configurable sleep plus a configurable CPU burn, so job duration is an
+input rather than a confound. The real analytics engine is phase 4 and must not be on the critical
+path of a phase-2 measurement.
+
+Sweep **consumers ∈ {1, 4, 16, 64}** × **arrival rate ∈ {0.1, 1, 10 jobs/sec}** × **poll interval ∈
+{100ms, 1s, 5s}** (Postgres only), against the compose stack, with a fixed warm-up and a fixed
+duration per cell. Both implementations get the same harness and the same generator; the harness is
+committed, so the numbers can be re-run rather than believed.
+
+64 consumers is well past this workload's plausible ceiling and is there on purpose: the interesting
+cell is the one where Postgres stops being fine, and a sweep that never reaches it proves nothing.
+
+### What result changes the decision
+
+Written down in advance, so it cannot be adjusted to fit what is measured:
+
+- **Postgres stays the default** if, at 16 consumers and 1 job/sec, p99 enqueue→reserve stays under
+  **one second** and reserve traffic stays under **5% of Postgres backend CPU**.
+- **RabbitMQ becomes the recommendation** if either bound breaks at or below **16 consumers**, or if
+  idle polling alone measurably raises database latency for the chat workload sharing that instance —
+  the failure mode that actually motivates the folklore. Note that this comparison is not
+  Postgres-versus-nothing: the orphan sweep means the RabbitMQ configuration also queries Postgres on
+  a timer, just once per replica rather than once per consumer. That ratio is the honest form of the
+  question, and a sweep interval long enough makes it lopsided in RabbitMQ's favour by construction —
+  so the report states both intervals next to the numbers.
+- **If neither happens by 64 consumers**, the finding is that this workload should use Postgres and
+  the folklore does not apply at this scale. That is a legitimate and likely outcome, and the report
+  says so plainly.
+
+The report lands as `docs/benchmark.md` with the raw numbers, the harness invocation, and the
+hardware it ran on — which is a laptop under Docker Desktop, stated as a limitation rather than
+implied to be a datacenter.
+
+## What the socket sees
+
+`websocket.md`'s phasing table assigns phase 2 the `job_status` frame and `cancel`. Both need
+narrowing, because their honest scope depends on phase 3.
+
+**`job_status`** — `seq`, `job_id`, `state`, `progress` — is a durable fact about a job and gets a
+`seq` under `persistence.md`'s rule. In phase 2 there is no worker to report progress, so the frame
+lands carrying state transitions only, driven by the synthetic consumer. Phase 3 fills in `progress`
+and routes it through the fanout exchange. Frame shape does not change between the two — the same
+discipline the stub responder exists to enforce.
+
+**`cancel`** is the harder half, because "stop it" means two unrelated things depending on whether a
+consumer has the job yet.
+
+- **Not yet reserved.** A state transition: the row moves to `cancelled` and no consumer ever claims
+  it. Entirely phase 2's business, and it is the common case — the whole reason a user cancels is
+  that the job has been sitting in a queue.
+- **Already reserved and running.** Someone has to *tell a busy process to stop*, and then that
+  process has to notice.
+
+Phase 2 lands both halves of what it honestly can: the state transition, plus a **`cancel_requested`
+flag on the row that a consumer polls between units of work**. `nack`ing a cancelled job is then a
+normal terminal outcome rather than a failure. The flag is the portable half — a phase-3 worker
+checks it between iterations of a solve loop for exactly the same reason the mock does.
+
+What phase 2 does **not** do is the case that actually motivates the question: a worker blocked
+inside a single long numpy call, which checks nothing and can only be stopped by killing the process
+that holds it. That needs a real process, a signal path into it, and a decision about what a
+half-written artifact means — `roadmap.md` already assigns all three to phase 3.
+
+The trap worth naming: the mock worker is cooperative `asyncio` and can be cancelled trivially, so an
+in-flight cancel implemented against it would pass its tests and then fail against real work. Polling
+a flag is slower and less impressive, and it is the version that survives the phase-3 rewrite.
+
+## Work, in dependency order
+
+One concern per PR, as in phase 0 and 1b.
+
+1. **`core/jobs.py`** — the Protocol, `JobRequest`/`Job`/`Lease`, `JobState`. No infrastructure;
+   `test_layering.py` covers it the moment it exists.
+2. **An in-memory implementation plus the shared contract suite.** The fake is not a test double
+   here, it is the third implementation and the reference semantics — and it is what keeps `make
+   test` container-free while the contract is being argued.
+3. **The `jobs` table**, as one Alembic revision.
+4. **`adapters/postgres/job_queue.py`** — `SKIP LOCKED`, leases, expiry-as-predicate. Same suite,
+   marked `postgres`, skipping when nothing answers.
+5. **`adapters/rabbitmq/job_queue.py`** — quorum queues, consumer at prefetch 1, DLX+TTL retry
+   ladder, and the dual write with its `published_at` sweep. Same suite, marked `rabbitmq`. The
+   sweep gets its own test: publish is stubbed to fail, and the job still runs.
+6. **The benchmark harness and `docs/benchmark.md`.**
+7. **`job_status` and narrowed `cancel`** on the wire, additive under `v1`.
+
+Steps 4 and 5 are the phase. Step 2 is what makes them comparable, and it comes first because a
+contract nobody has implemented twice is a guess.
+
+## Testing
+
+The suite is parametrized over implementations and run once per implementation, with the in-memory
+one always on and the other two skipping when their service is unreachable — extending
+`conftest.py`'s existing pattern rather than inventing a second one. `make test` stays container-free
+and `make up` turns the rest on with no flag to remember.
+
+What the contract suite has to prove, on all three:
+
+- **A reserved job is not reserved again** while its lease holds, under concurrent consumers.
+- **A lease that expires makes the job reservable again**, exactly once.
+- **`ack` is terminal** — no redelivery after it, ever.
+- **`nack(retry_in)` does not redeliver early**, and does redeliver after.
+- **`attempts` is monotonic**, and `max_attempts` reaches `dead` rather than looping.
+- **`enqueue` is idempotent** on `(session_id, idempotency_key)`.
+- **FIFO-ish ordering** by `run_after, created_at` — asserted as "not egregiously reordered" rather
+  than strict FIFO, which no competing-consumer queue actually offers.
+
+And two that need real infrastructure, because a fake cannot falsify them — the same argument
+`persistence.md` makes about gap-free `seq`:
+
+- **`SKIP LOCKED` under a genuine race:** N consumers claim concurrently, every job goes to exactly
+  one, nobody blocks.
+- **Redelivery after a hard kill:** `SIGKILL` a consumer holding a lease, assert the job completes
+  elsewhere. This is phase 2's half of phase 3's acceptance criterion, testable early because the
+  synthetic worker is under the test's control.
+
+Note the trap `websocket.md` records and 1b hit: a test asserting "and then it is redelivered" hangs
+rather than fails when redelivery never happens. Every wait gets `asyncio.wait_for`.
+
+## Settled
+
+Decided 2026-08-20, recorded here so the reasoning outlives the conversation:
+
+- **The consumer is a mock worker**, standing to the phase-3 worker as `StubResponder` does to the
+  phase-4 gateway. `worker/` stays empty. The synthetic solver is throwaway on purpose.
+- **Quorum queues**, not classic — the comparison is worth having against RabbitMQ's real default.
+- **`lease` is a per-call argument.** Queue-level is the weaker option, not the more advanced one.
+- **`cancel` lands as a state transition plus a polled `cancel_requested` flag.** Interrupting a
+  worker blocked inside a numpy call stays phase 3.
+- **The RabbitMQ dual write is repaired, not accepted** — with a `published_at` column and a sweep
+  rather than a full outbox. Only one of its three failure modes can actually lose a job, and the
+  other two are already absorbed by the claim being a conditional `update`. The repair is an outbox
+  collapsed into the `jobs` table, and what it cost is itself the finding.
+
+## Open
+
+Questions the repo cannot answer on its own.
+
+1. **The sweep's two constants** — every 30 seconds, for jobs unpublished after 2 minutes — are
+   guesses, and the second one is the one that matters: too low and it republishes during a broker
+   blip the publish would have survived, too high and a lost job stays lost that much longer.
+   Worth setting against a measured publish latency rather than by feel.
+2. **Retention.** `jobs` grows without bound, exactly as `chat_messages` does. Same open question,
+   and probably the same eventual answer, but the payload here is `jsonb` and much larger.
+3. **Does `cancel` need an idempotency key?** It is a state transition, so it is naturally idempotent
+   — but a client that cancels twice across a reconnect should get the same answer both times, and
+   that is worth asserting rather than assuming.
