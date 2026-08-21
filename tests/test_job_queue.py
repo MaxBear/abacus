@@ -166,6 +166,37 @@ async def test_reserve_prefers_the_job_that_became_ready_first(queue):
     assert late.id != ready.id
 
 
+async def test_reserve_hands_out_ready_jobs_in_ready_order(queue):
+    # Both jobs are reservable by the time anyone asks, so `_reservable` cannot
+    # decide this one and the claim query's `order by` has to. Every other test
+    # in this file passes with that ordering inverted.
+    ready = await queue.enqueue(a_request())
+    later = await queue.enqueue(a_request(delay=UNIT * 2))
+    await asyncio.sleep((UNIT * 3).total_seconds())
+
+    first = await reserve(queue, owner="w1", lease=UNIT * 20)
+    second = await reserve(queue, owner="w2", lease=UNIT * 20)
+
+    assert first is not None and second is not None
+    assert [first.job.id, second.job.id] == [ready.id, later.id]
+
+
+async def test_run_after_outranks_creation_order(queue):
+    # The two halves of `order by run_after, created_at` disagree here: the
+    # delayed job was created first, the prompt one became ready first. Readiness
+    # wins, which is what makes the ordering key two columns and not one — and an
+    # implementation that dropped the `order by` altogether would hand back the
+    # older row instead.
+    delayed = await queue.enqueue(a_request(delay=UNIT * 2))
+    prompt = await queue.enqueue(a_request())
+    await asyncio.sleep((UNIT * 3).total_seconds())
+
+    lease = await reserve(queue, owner="w1", lease=UNIT * 20)
+
+    assert lease is not None and lease.job.id == prompt.id
+    assert delayed.id != prompt.id
+
+
 async def test_concurrent_consumers_each_get_a_different_job(queue):
     ids = {(await queue.enqueue(a_request())).id for _ in range(4)}
 
@@ -400,3 +431,67 @@ async def test_cancel_does_not_disturb_a_finished_job(queue):
     # a completed job's state would throw away a result that exists.
     assert cancelled.state is JobState.DONE
     assert cancelled.result_ref == "s3://bucket/key"
+
+
+async def test_a_cancelled_job_whose_consumer_dies_is_still_not_a_failure(queue):
+    # The crash counterpart of the test above it. `nack` settles that a cancelled
+    # job is never reported as a failure, and the consumer that crashes is
+    # precisely the one that never calls `nack` — so the claim path has to apply
+    # the same rule, or the user who asked for this gets an error instead.
+    job = await queue.enqueue(a_request(max_attempts=1))
+    lease = await reserve(queue, lease=UNIT)
+    assert lease is not None
+
+    await queue.cancel(job.id)  # flag raised, then the consumer dies: no ack, no nack
+
+    assert await reserve(queue, wait_for=UNIT * 5) is None
+    stored = await queue.get(job.id)
+    assert stored.state is JobState.CANCELLED
+    # Not `dead`, and carrying no lease-expiry message: the outcome a client sees
+    # must not depend on how the consumer happened to stop.
+    assert stored.error is None
+
+
+async def test_a_cancelled_job_is_not_redelivered_to_burn_its_remaining_attempts(queue):
+    # Same crash with attempts to spare. Redelivering would claim a consumer,
+    # extend once, discover the flag and `nack` — a round trip to reach the state
+    # the queue could already name.
+    job = await queue.enqueue(a_request(max_attempts=3))
+    lease = await reserve(queue, lease=UNIT)
+    assert lease is not None
+
+    await queue.cancel(job.id)
+
+    assert await reserve(queue, wait_for=UNIT * 5) is None
+    stored = await queue.get(job.id)
+    assert stored.state is JobState.CANCELLED
+    assert stored.attempts == 1
+
+
+async def test_cancel_of_a_failed_job_stops_the_retry(queue):
+    # `failed` is "queued, backing off", so it is cancellable for the same reason
+    # `queued` is: no consumer holds it, and the retry has not happened yet.
+    job = await queue.enqueue(a_request())
+    lease = await reserve(queue)
+    await queue.nack(lease, error="boom", retry_in=UNIT)
+    assert (await queue.get(job.id)).state is JobState.FAILED
+
+    cancelled = await queue.cancel(job.id)
+
+    assert cancelled.state is JobState.CANCELLED
+    assert await reserve(queue, wait_for=UNIT * 5) is None
+
+
+async def test_a_consumer_that_finishes_before_seeing_the_flag_still_wins(queue):
+    # The race `cancel` cannot close: the work is done and paid for by the time
+    # the flag is read. `ack` does not consult it, for the same reason cancelling
+    # an already-`done` job is a no-op.
+    job = await queue.enqueue(a_request())
+    lease = await reserve(queue)
+
+    await queue.cancel(job.id)
+    await queue.ack(lease, result_ref="s3://bucket/key")
+
+    stored = await queue.get(job.id)
+    assert stored.state is JobState.DONE
+    assert stored.result_ref == "s3://bucket/key"

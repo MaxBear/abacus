@@ -14,7 +14,7 @@ proves the semantics are coherent, not that Postgres implements them.
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from core.jobs import Job, JobRequest, JobState, Lease, StaleLease
@@ -35,7 +35,6 @@ class _Row:
     lease_id: uuid.UUID | None = None
     lease_expires_at: datetime | None = None
     lease_owner: str | None = None
-    keys: dict[str, str] = field(default_factory=dict)
 
 
 def _now() -> datetime:
@@ -121,7 +120,7 @@ class MemoryJobQueue:
 
     def _claim(self, owner: str, lease: timedelta) -> Lease | None:
         now = _now()
-        self._retire_poison(now)
+        self._retire_lapsed(now)
         candidates = [row for row in self._rows.values() if self._reservable(row, now)]
         if not candidates:
             return None
@@ -137,29 +136,49 @@ class MemoryJobQueue:
         row.lease_owner = owner
         return Lease(id=row.lease_id, job=row.job, owner=owner, expires_at=row.lease_expires_at)
 
-    def _retire_poison(self, now: datetime) -> None:
-        """Send lapsed leases with no attempts left to `DEAD`.
+    def _retire_lapsed(self, now: datetime) -> None:
+        """Finish jobs whose consumer died and is never coming back.
 
-        `nack` cannot do this job alone: it is the *crashing* consumer that
-        never calls it, and a job that reliably kills whatever picks it up is
-        exactly the one a delivery limit exists to stop. Without this, a lapsed
-        lease is reclaimed forever and `attempts` runs past `max_attempts` with
-        nothing ever noticing.
+        Two kinds, both recognised by a lapsed lease on a `RUNNING` row:
 
-        Done here rather than in a sweeper for the same reason expiry is a
-        predicate: the claim path is the only thing that has to notice, so there
-        is no background process whose failure would be silent.
+        - **Out of attempts** goes to `DEAD`. A job that reliably kills whatever
+          picks it up is exactly what a delivery limit exists to stop.
+        - **Cancel requested** goes to `CANCELLED`, however many attempts remain.
+          `nack` already rules that a cancelled job is never reported as a
+          failure, and that rule cannot depend on how many attempts happened to
+          be left when the consumer died. Redelivering it instead would claim a
+          consumer, extend once, discover the flag and `nack` — a whole round
+          trip, and a burned attempt, to arrive at the same state.
+
+        `nack` cannot do either job: it is the *crashing* consumer that never
+        calls it. Without this the row sits at `RUNNING` forever — no terminal
+        state, nothing to tell a client polling `get`, and a state a reader
+        cannot distinguish from healthy, which is the same failure the
+        `streaming` row was in phase 1b. Excluding it from `_reservable` is not
+        enough on its own: invisible is not the same as finished.
+
+        Done on the claim path rather than in a sweeper for the same reason
+        expiry is a predicate: the only thing that has to notice is already
+        looking, so there is no background process whose failure would be
+        silent.
         """
         for row in self._rows.values():
-            if row.job.state is not JobState.RUNNING or row.job.attempts < row.job.max_attempts:
+            if row.job.state is not JobState.RUNNING:
                 continue
             if row.lease_expires_at is None or row.lease_expires_at > now:
                 continue
-            row.job = _replace_state(
-                row.job,
-                JobState.DEAD,
-                error=row.job.error or "lease expired with no attempts remaining",
-            )
+            if row.job.cancel_requested:
+                # No error, and not the one below: the user asked for this and
+                # already knows what happened.
+                row.job = _replace_state(row.job, JobState.CANCELLED)
+            elif row.job.attempts >= row.job.max_attempts:
+                row.job = _replace_state(
+                    row.job,
+                    JobState.DEAD,
+                    error=row.job.error or "lease expired with no attempts remaining",
+                )
+            else:
+                continue
             self._release(row)
 
     @staticmethod
@@ -168,8 +187,17 @@ class MemoryJobQueue:
 
         A running job whose lease has lapsed is reservable on the spot, so there
         is no window between expiry and recovery and no background process whose
-        failure would be invisible. The attempts bound is checked here too:
-        reclaiming is a retry, and a retry past `max_attempts` is not one.
+        failure would be invisible.
+
+        The last two clauses restate what `_retire_lapsed` has already acted on
+        by the time this runs — a lapsed lease that is out of attempts or has
+        been cancelled is no longer `RUNNING`. They are kept because this
+        predicate is the specification of what is reservable, and the Postgres
+        side spells the same two exclusions into its index predicate; a reader
+        should be able to answer "would this be handed out?" from here alone.
+        Neither is load-bearing in this call path, and neither is a substitute
+        for the sweep: excluding a row only makes it invisible, and invisible is
+        not the same as finished.
         """
         if row.job.state in (JobState.QUEUED, JobState.FAILED):
             return row.run_after <= now
@@ -178,6 +206,7 @@ class MemoryJobQueue:
                 row.lease_expires_at is not None
                 and row.lease_expires_at <= now
                 and row.job.attempts < row.job.max_attempts
+                and not row.job.cancel_requested
             )
         return False
 

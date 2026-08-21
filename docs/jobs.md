@@ -49,6 +49,74 @@ five-minute jobs at once; they sit in that consumer's buffer while other consume
 dies they all wait for the channel to close. One in flight per consumer is what makes the two
 implementations comparable at all.
 
+## The job's life, and what cancel does to it
+
+Six states, and the only two that are easy to confuse are `failed` and `dead`. This is the contract
+in [`core/jobs.py`](../core/jobs.py) drawn out, not a sketch alongside it, and every edge below is
+asserted in `tests/test_job_queue.py`.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> queued : enqueue()
+
+    queued --> running : reserve()
+    failed --> running : backoff elapses,<br/>reclaimed
+
+    running --> done : ack()
+    running --> failed : nack(), attempts remain
+    running --> dead : nack(), attempts exhausted
+
+    running --> running : lease lapses,<br/>redelivered
+    running --> dead : lease lapses,<br/>no attempts left
+
+    queued --> cancelled : cancel()
+    failed --> cancelled : cancel()
+    running --> running : cancel() —<br/>flag only
+    running --> cancelled : consumer sees flag,<br/>nack()
+    running --> cancelled : lease lapses,<br/>flag already set
+    running --> done : finished first (race)
+
+    done --> [*]
+    dead --> [*]
+    cancelled --> [*]
+
+    note right of running
+        cancel() here is a request only.
+        The job keeps running until the
+        consumer checks the flag on extend().
+    end note
+```
+
+Three things in that picture are worth saying in words, because they are the ones a reader
+reconstructs wrongly from the state names alone:
+
+- **`failed` does not pass back through `queued`.** It goes straight to `running` when its backoff
+  elapses. `failed` *is* "queued, backing off" — the claim path treats the two states identically,
+  which is why the partial index is on `state in ('queued','failed')` and why `terminal` excludes
+  `failed`. A client polling `state` needs "not yet" and "never" to be different answers, and that
+  distinction is the whole reason `dead` exists as a separate state.
+- **Expiry is a self-loop, not an escape.** A crashed consumer's lease lapses and the job is
+  reclaimed as `running` again with `attempts` incremented — no intermediate state, because expiry
+  is a predicate on the claim query rather than a sweeper that rewrites the row.
+- **`cancel()` on a running job is two different operations under one name.** Unreserved, it is a
+  transition and the job never reaches a consumer. Reserved, it only raises `cancel_requested`, and
+  the job's actual ending depends on what the consumer does next — which is why `running` has three
+  outgoing edges after a cancel and one of them is `done`.
+
+**`running` has four outgoing edges after a cancel, and only one of them is `cancelled` by the
+consumer's own hand.** The other three are the ways a cancel can be overtaken: the work finishes
+first and `ack` wins, the consumer dies and the lapsed-lease path names the outcome instead, or —
+before any of that — nothing happens at all, because the consumer has not reached its next `extend`.
+That last one is the honest limit of a polled flag, and phase 3 is where a signal path into a
+running process could change it.
+
+The rule tying the crash cases together: **once `cancel_requested` is set, no path may report the
+job as a failure.** `nack` applies it whatever error the consumer passes, and the lapsed-lease sweep
+applies it whatever the attempt count — otherwise the guarantee would hold only for consumers that
+shut down politely, which are not the ones it exists to cover.
+
 ## `jobs` is the system of record, in both worlds
 
 Both implementations write the same table. The queue moves a job *id*; the job's state lives in
@@ -99,10 +167,20 @@ create table jobs (
 
 create unique index uq_jobs_session_id_idempotency_key on jobs (session_id, idempotency_key);
 
--- The reserve index. Equality on state, then the two range columns the claim
--- query orders and filters by.
-create index ix_jobs_reservable on jobs (state, run_after, created_at)
-  where state = 'queued';
+-- The reserve index. The state lives in the predicate rather than in the key:
+-- a partial index only ever holds rows the claim query wants, so a leading
+-- `state` column would widen every entry without narrowing a single scan. What
+-- is left is exactly the `order by`. `failed` is in the predicate because a job
+-- awaiting retry becomes reservable once its `run_after` passes; `running` is
+-- not, because a lapsed lease is found through `ix_jobs_expired_leases` instead.
+create index ix_jobs_reservable on jobs (run_after, created_at)
+  where state in ('queued', 'failed');
+
+-- The expiry index. Separate and partial rather than folded into the one above:
+-- the two branches have disjoint predicates and different sort keys, so a single
+-- combined index would serve neither. See "Expiry is a query, not a daemon".
+create index ix_jobs_expired_leases on jobs (lease_expires_at)
+  where state = 'running';
 ```
 
 `lease_id` is a **fencing token**, and it is the reason `lease_owner` is explicitly not one. A
@@ -184,7 +262,7 @@ update jobs set
     updated_at = now()
 where id = (
     select id from jobs
-    where state = 'queued' and run_after <= now()
+    where state in ('queued', 'failed') and run_after <= now()
     order by run_after, created_at
     for update skip locked
     limit 1
@@ -204,7 +282,8 @@ back to `queued`, the claim query's predicate becomes:
 ```sql
 -- what is reservable, stated as one predicate. NOT how to query it — see below.
 where (state in ('queued', 'failed') and run_after <= now())
-   or (state = 'running' and lease_expires_at < now() and attempts < max_attempts)
+   or (state = 'running' and lease_expires_at < now()
+       and attempts < max_attempts and not cancel_requested)
 ```
 
 No background process, nothing to deploy, nothing to fail silently, and no window between expiry and
@@ -243,10 +322,23 @@ the same failure the `streaming` row was in phase 1b — a state a reader cannot
 the claim path retires them on contact, in the same statement that does the reclaiming:
 
 ```sql
-update jobs set state = 'dead',
-                error = coalesce(error, 'lease expired with no attempts remaining')
- where state = 'running' and lease_expires_at < now() and attempts >= max_attempts;
+update jobs set state = case when cancel_requested then 'cancelled' else 'dead' end,
+                error = case when cancel_requested then error
+                             else coalesce(error, 'lease expired with no attempts remaining')
+                        end
+ where state = 'running' and lease_expires_at < now()
+   and (attempts >= max_attempts or cancel_requested);
 ```
+
+**The `cancel_requested` arm is not a special case bolted on.** `nack` already rules that a cancelled
+job is never reported as a failure whatever the consumer says; the consumer that *crashes* is
+precisely the one that never calls `nack`, so the same rule has to be applied here or it holds only
+when the worker was well behaved. It fires regardless of attempts remaining, for two reasons: the
+outcome a client sees must not depend on how many attempts happened to be left when the process
+died, and redelivering a job whose flag is already set would claim a consumer, extend once, discover
+the flag and `nack` — a full round trip, and a burned attempt, to reach the state the queue could
+already name. Note the `error` arm: a cancelled job must not inherit the lease-expiry message, since
+not putting an error in front of someone who asked for this is the entire point.
 
 This is what `x-delivery-limit` gives for free on quorum queues, and it is the clearest single case
 where that choice earns its place in the comparison.
@@ -486,6 +578,13 @@ Decided 2026-08-20, recorded here so the reasoning outlives the conversation:
 - **`lease` is a per-call argument.** Queue-level is the weaker option, not the more advanced one.
 - **`cancel` lands as a state transition plus a polled `cancel_requested` flag.** Interrupting a
   worker blocked inside a numpy call stays phase 3.
+- **A lapsed lease on a cancelled job reaches `cancelled`, not `dead`** — and regardless of attempts
+  remaining. Decided 2026-08-21. The counter-argument is real: a consumer that died mid-solve may
+  have completed side effects, so `cancelled` can claim something did not happen when it did. It
+  loses because `dead` makes the *stronger* false claim — permanent failure — while also putting an
+  error in front of someone who asked for this, and because the redelivery path already reported
+  `cancelled` for the identical crash whenever attempts happened to remain. An outcome that depends
+  on the attempt count is arbitrary, not conservative.
 - **The RabbitMQ dual write is repaired, not accepted** — with a `published_at` column and a sweep
   rather than a full outbox. Only one of its three failure modes can actually lose a job, and the
   other two are already absorbed by the claim being a conditional `update`. The repair is an outbox
