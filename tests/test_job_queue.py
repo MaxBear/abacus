@@ -6,11 +6,13 @@ this suite *unmodified* is the phase's actual deliverable — a Protocol nobody
 has implemented twice is a guess, and a suite rewritten to accommodate the
 second implementation has stopped being evidence. See `docs/jobs.md`.
 
-Only `memory` runs today. It is the reference semantics, and it is deliberately
-the implementation that cannot demonstrate the two claims that matter most:
-`SKIP LOCKED` under a genuine race, and redelivery after a hard kill. Those get
-marked sections when the real implementations land, exactly as
-`test_chat_repository.py` does for gap-free `seq`.
+`memory` always runs; `rabbitmq` skips itself when no broker or database
+answers, so `make test` stays container-free and `make up` turns the rest on with
+no flag to remember. What the memory run cannot demonstrate — competing
+consumers under a genuine race, and redelivery after a consumer is cut off
+mid-job — is asserted against the real implementation in
+`test_rabbitmq_job_queue.py`, exactly as `test_chat_repository.py` does for
+gap-free `seq`.
 
 Leases here are short *real* durations rather than an injected clock, because
 Postgres' `now()` is the database's and no test can advance it. Uniform
@@ -37,7 +39,7 @@ UNIT = timedelta(milliseconds=120)
 BRIEF = UNIT
 
 
-@pytest.fixture(params=["memory"])
+@pytest.fixture(params=["memory", pytest.param("rabbitmq", marks=pytest.mark.rabbitmq)])
 def queue(request):
     if request.param == "memory":
         return MemoryJobQueue()

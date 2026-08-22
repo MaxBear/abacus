@@ -58,5 +58,8 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 # Selectable with `-m postgres`, but not excluded by default: these skip
 # themselves when no database answers, so one command covers both situations.
-markers = ["postgres: needs a real Postgres (make up && make migrate)"]
+markers = [
+    "postgres: needs a real Postgres (make up && make migrate)",
+    "rabbitmq: needs a real RabbitMQ and Postgres (make up && make migrate)",
+]
 addopts = "-q"
