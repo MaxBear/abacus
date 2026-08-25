@@ -13,3 +13,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Scratch review notes. Findings belong in a commit message, a PR, or docs/ —
+# not in a tracked file nobody prunes. TODO-queue-fixes.md was one of these and
+# outlived every item in it.
+TODO-*.md
