@@ -50,21 +50,25 @@ async def store():
     """
     settings = get_settings()
     store = await S3ObjectStore.start(settings)
-    try:
-        await store.ensure_bucket()
-    except (EndpointConnectionError, OSError):
-        await store.close()
-        pytest.skip("no object store reachable — `make up`, and S3_ENDPOINT_URL in .env")
-
     written: list[str] = []
-    _put = store.put
-
-    async def put(key, data, *, content_type="application/octet-stream"):
-        written.append(key)
-        return await _put(key, data, content_type=content_type)
-
-    store.put = put
+    # Everything after `start` is inside this, including the skip: the client
+    # holds an aiohttp session, and the reachability probe is not the only thing
+    # that can fail here. `head_bucket` under scoped credentials answers
+    # `AccessDenied`, which is a `ClientError` and would otherwise leave the
+    # session open for the rest of the run.
     try:
+        try:
+            await store.ensure_bucket()
+        except (EndpointConnectionError, OSError):
+            pytest.skip("no object store reachable — `make up`, and S3_ENDPOINT_URL in .env")
+
+        _put = store.put
+
+        async def put(key, data, *, content_type="application/octet-stream"):
+            written.append(key)
+            await _put(key, data, content_type=content_type)
+
+        store.put = put
         yield store
     finally:
         # The bucket is shared across runs and nothing lists it, so a test that
@@ -78,11 +82,10 @@ async def store():
 
 @pytest.mark.s3
 async def test_put_then_get_round_trips_the_bytes(store):
-    ref = await store.put(
-        artifact_key(uuid.uuid4(), uuid.uuid4()), b"\x00result\xff", content_type="application/json"
-    )
+    key = artifact_key(uuid.uuid4(), uuid.uuid4())
+    await store.put(key, b"\x00result\xff", content_type="application/json")
 
-    assert await store.get(ref) == b"\x00result\xff"
+    assert await store.get(key) == b"\x00result\xff"
 
 
 @pytest.mark.s3
@@ -107,8 +110,9 @@ async def test_two_attempts_at_one_job_leave_two_objects(store):
     written garbage rather than damage.
     """
     job = uuid.uuid4()
-    first = await store.put(artifact_key(job, uuid.uuid4()), b"first", content_type="text/plain")
-    second = await store.put(artifact_key(job, uuid.uuid4()), b"second", content_type="text/plain")
+    first, second = artifact_key(job, uuid.uuid4()), artifact_key(job, uuid.uuid4())
+    await store.put(first, b"first", content_type="text/plain")
+    await store.put(second, b"second", content_type="text/plain")
 
     assert await store.get(first) == b"first"
     assert await store.get(second) == b"second"
@@ -116,14 +120,15 @@ async def test_two_attempts_at_one_job_leave_two_objects(store):
 
 @pytest.mark.s3
 async def test_delete_removes_the_object_and_deleting_again_is_fine(store):
-    ref = await store.put(artifact_key(uuid.uuid4(), uuid.uuid4()), b"x", content_type="text/plain")
+    key = artifact_key(uuid.uuid4(), uuid.uuid4())
+    await store.put(key, b"x", content_type="text/plain")
 
-    await store.delete(ref)
+    await store.delete(key)
     with pytest.raises(ArtifactNotFound):
-        await store.get(ref)
+        await store.get(key)
 
     # The reaper this exists for cannot know what another pass already took.
-    await store.delete(ref)
+    await store.delete(key)
 
 
 @pytest.mark.s3

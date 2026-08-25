@@ -17,7 +17,7 @@ from typing import Protocol
 
 
 class ArtifactNotFound(Exception):
-    """No object lives at that ref.
+    """No object lives at that key.
 
     A distinct type because the caller can act on it: a `result_ref` that
     resolves to nothing is a bug in this system — the write precedes the `ack`
@@ -45,14 +45,14 @@ def artifact_key(job_id: uuid.UUID, lease_id: uuid.UUID) -> str:
 
 
 class ObjectStore(Protocol):
-    """Durable storage for artifacts, addressed by an opaque ref.
+    """Durable storage for artifacts, addressed by key.
 
     Implementations own their own client and its lifecycle. A caller never sees
     a bucket, a session, or a botocore exception.
     """
 
-    async def put(self, key: str, data: bytes, *, content_type: str) -> str:
-        """Store the bytes and return the ref that finds them again.
+    async def put(self, key: str, data: bytes, *, content_type: str) -> None:
+        """Store the bytes under `key`.
 
         One request, never multipart. `docs/worker.md` rests "no partial
         artifact is ever visible as a finished one" on the atomicity of a
@@ -63,18 +63,20 @@ class ObjectStore(Protocol):
         which is the right trade at phase 4's result sizes and the thing to
         revisit before it is not.
 
-        Returns the ref rather than nothing, and callers store *that* rather
-        than the key they passed. Today they are the same string; making the
-        call site read `result_ref = await store.put(...)` is what keeps them
-        free to stop being.
+        Returns nothing, because there is nothing to return that the caller does
+        not already hold. The key *is* the ref: `Job.result_ref` stores exactly
+        this string, and `get` takes exactly it back. An opaque handle minted
+        here would be the shape to reach for if a ref could ever be something
+        else — a bucket-qualified URI, a signed URL — and `S3ObjectStore.put`
+        settles that it cannot.
         """
         ...
 
-    async def get(self, ref: str) -> bytes:
-        """The bytes at `ref`, or `ArtifactNotFound`."""
+    async def get(self, key: str) -> bytes:
+        """The bytes at `key`, or `ArtifactNotFound`."""
         ...
 
-    async def delete(self, ref: str) -> None:
+    async def delete(self, key: str) -> None:
         """Remove the object. Idempotent: deleting nothing is not an error.
 
         Not on any correctness path — no artifact is ever overwritten or

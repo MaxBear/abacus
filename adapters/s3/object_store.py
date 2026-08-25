@@ -6,7 +6,7 @@ a synchronous `put_object` on that loop is a multi-second stall in the same
 place `docs/worker.md` refuses to put a five-minute one. The child process is
 free to be synchronous; nothing that shares a loop with an AMQP heartbeat is.
 
-What crosses this line is bytes and a ref. `botocore`'s exceptions do not — a
+What crosses this line is bytes and a key. `botocore`'s exceptions do not — a
 `ClientError` with a string code inside is exactly the kind of storage detail
 `core/` is arranged not to know, and the one distinction a caller can act on
 (`ArtifactNotFound`) is worth translating by hand.
@@ -94,32 +94,32 @@ class S3ObjectStore:
             log.info("creating bucket %s", self._bucket)
             await self._client.create_bucket(Bucket=self._bucket)
 
-    async def put(self, key: str, data: bytes, *, content_type: str) -> str:
-        await self._client.put_object(
-            Bucket=self._bucket, Key=key, Body=data, ContentType=content_type
-        )
-        # The key, not a URI. The bucket is deployment configuration and is
-        # already in the environment of everything that could read this back;
+    async def put(self, key: str, data: bytes, *, content_type: str) -> None:
+        # The key is what `Job.result_ref` ends up holding — a bare key, not a
+        # bucket-qualified URI. The bucket is deployment configuration and is
+        # already in the environment of anything that could read this back;
         # copying it into every `jobs` row would mean a rename rewrites history
         # to describe objects that did not move, and a ref naming a foreign
         # bucket is an access-control question phase 3 has no answer to.
-        return key
+        await self._client.put_object(
+            Bucket=self._bucket, Key=key, Body=data, ContentType=content_type
+        )
 
-    async def get(self, ref: str) -> bytes:
+    async def get(self, key: str) -> bytes:
         try:
-            response = await self._client.get_object(Bucket=self._bucket, Key=ref)
+            response = await self._client.get_object(Bucket=self._bucket, Key=key)
         except ClientError as exc:
             if _code(exc) in _MISSING:
-                raise ArtifactNotFound(ref) from exc
+                raise ArtifactNotFound(key) from exc
             raise
         async with response["Body"] as body:
             return await body.read()
 
-    async def delete(self, ref: str) -> None:
+    async def delete(self, key: str) -> None:
         # `delete_object` on a missing key succeeds on both S3 and MinIO, so
         # idempotence is the backing store's here rather than something this
         # method has to arrange.
-        await self._client.delete_object(Bucket=self._bucket, Key=ref)
+        await self._client.delete_object(Bucket=self._bucket, Key=key)
 
     async def close(self) -> None:
         await self._stack.aclose()
