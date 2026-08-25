@@ -18,6 +18,7 @@ import uuid
 
 from pydantic import ValidationError
 
+from core.chat_repository import ChatRepository, StoredMessage
 from core.config import Settings
 from core.frames import (
     CLIENT_FRAME_ADAPTER,
@@ -33,7 +34,6 @@ from core.frames import (
     Resume,
     UserMessage,
 )
-from core.repository import ChatRepository, StoredMessage
 from core.responder import Responder
 from core.ws import WS_INTERNAL_ERROR, WS_NORMAL, Connection
 

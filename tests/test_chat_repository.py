@@ -21,7 +21,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from core.repository import Role, Status
+from core.chat_repository import Role, Status
 from tests.MockChatRepository import MockChatRepository
 
 

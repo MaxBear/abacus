@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 # wire rather than restated here — the same "one list, not two" the tables
 # module follows. `message` replays a stored row, so its vocabulary is the
 # row's; inventing a parallel set of strings is how the two drift.
-from core.repository import Role, Status
+from core.chat_repository import Role, Status
 
 # Bumped only for breaking changes. It rides on every frame from the first
 # commit because retrofitting a version field requires a flag day: there is no
