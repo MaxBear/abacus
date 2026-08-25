@@ -25,7 +25,16 @@ CORE = Path(__file__).resolve().parent.parent / "core"
 # docstring: "Deliberately free of FastAPI — it takes a Connection, a Responder,
 # and Settings, so the whole protocol can be exercised without a route or an
 # ASGI server."
-BANNED = {"sqlalchemy", "alembic", "aio_pika", "fastapi", "adapters", "api"}
+BANNED = {
+    "sqlalchemy",
+    "alembic",
+    "aio_pika",
+    "aiobotocore",
+    "botocore",
+    "fastapi",
+    "adapters",
+    "api",
+}
 
 
 def _imported_roots(source: str) -> set[str]:

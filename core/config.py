@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     # cut short by SIGKILL and accomplishes nothing.
     ws_drain_timeout_seconds: float = 5.0
 
+    # --- Object storage (docs/worker.md) ---
+
+    # MinIO under compose, real S3 in phase 6. `None` is what selects AWS: it
+    # lets botocore resolve the regional endpoint itself, which is the one thing
+    # a hardcoded URL cannot do correctly across regions.
+    s3_endpoint_url: str | None = "http://minio:9000"
+    s3_region: str = "us-east-1"
+
+    # Local credentials, matching the pattern DATABASE_URL and BROKER_URL
+    # already set: the compose stack's values are the defaults so a fresh
+    # checkout runs, and a deployment supplies its own. Phase 6 replaces both
+    # with a role rather than a longer string.
+    s3_access_key: str = "abacus"
+    s3_secret_key: str = "abacus-local-secret"  # noqa: S105 - a compose default, not a credential
+
+    s3_bucket: str = "abacus-artifacts"
+
 
 @lru_cache
 def get_settings() -> Settings:

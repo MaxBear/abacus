@@ -20,6 +20,9 @@ dependencies = [
     "asyncpg==0.30.0",
     "alembic==1.14.0",
     "aio-pika==9.5.4",
+    # The S3 client, async because the supervisor's loop has to keep
+    # scheduling while a solve runs — see adapters/s3/object_store.py.
+    "aiobotocore==2.24.2",
 ]
 
 [dependency-groups]
@@ -61,5 +64,6 @@ testpaths = ["tests"]
 markers = [
     "postgres: needs a real Postgres (make up && make migrate)",
     "rabbitmq: needs a real RabbitMQ and Postgres (make up && make migrate)",
+    "s3: needs a real object store (make up)",
 ]
 addopts = "-q"

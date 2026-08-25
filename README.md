@@ -57,6 +57,9 @@ Adding or bumping a dependency means editing `pyproject.toml` and running `make 
 
 RabbitMQ management UI: http://localhost:15672 (`abacus` / `abacus`).
 
+MinIO console: http://localhost:9001 (`abacus` / `abacus-local-secret`). The artifact bucket is
+created on first use by `S3ObjectStore.ensure_bucket`, not by compose.
+
 `make chat` serves `dev/chat.html`, a browser client for `/ws/chat/{session_id}` — raw frames in
 one pane, the assembled transcript in the other, and buttons for the paths a unit test cannot
 reach from a browser: the connection cap, refused handshakes, close codes. It is a test harness,
@@ -78,7 +81,7 @@ infra/       Terraform + k8s manifests.                (phase 6)
 
 ## Three decisions worth knowing about
 
-**Dependencies are locked, not just pinned.** `pyproject.toml` pins the eight direct
+**Dependencies are locked, not just pinned.** `pyproject.toml` pins the nine direct
 dependencies; `uv.lock` pins those *and* the ~30 transitives they drag in — starlette, anyio,
 greenlet, the `uvicorn[standard]` extras — which the old `requirements.txt` left floating. Two
 builds of the same commit a month apart used to be able to produce different images. The Docker
