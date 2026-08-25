@@ -102,10 +102,23 @@ sufficient, and a test suite that only exercises layer 1 has proved nothing abou
 ## Running twice, and the difference between that and *counting* twice
 
 The roadmap asks how at-least-once is squared with solves that must not silently run twice. The
-honest answer is that it is not, and cannot be: a worker partitioned from Postgres can be alive and
-computing while another worker legitimately takes the job. Two executions is a fact of this design,
-and phase 2 chose it knowingly — the lease covers the consumer the broker cannot see, the channel
-covers the consumer Postgres cannot see, and the overlap is the price.
+honest answer is that it is not, and cannot be, because **a lease expiring is a guess about a
+process rather than proof about one.** A worker whose box is swapping, whose child is deep inside a
+BLAS call, or whose connection to Postgres has blinked is still computing while its deadline passes.
+`_sweep` finds the job in `lapsed_reservable` and offers it again, another worker claims it, and
+nothing has gone wrong — there are simply two processes solving one job.
+
+This is not the unbuilt Postgres backend showing through. It is the shipped implementation, where
+two redelivery paths overlap and neither can see the other's evidence: **the channel**, when a
+worker's process dies and RabbitMQ requeues everything it held without Postgres being consulted, and
+**the row**, when a worker is alive but past its deadline — which the broker cannot see, because
+`extend` has no broker half to tell it. `adapters/rabbitmq/job_queue.py` says as much in its own
+docstring. Phase 2 chose the overlap knowingly; phase 3 is where the price is paid.
+
+Phase 3 sharpens it rather than softening it. Phase 2's consumer was cooperative `asyncio` and
+stopped the moment it was told to. Phase 3's solve is a `spawn`ed child inside numpy that checks
+nothing until it returns, so between a supervisor learning its lease is stale and the child being
+signalled and reaped, two live attempts exist by construction rather than by mishap.
 
 What is preventable is **two executions having two effects**. Three things make that true, and they
 are the same three that satisfy "no partial artifact is ever visible as a finished one":
