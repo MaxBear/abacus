@@ -61,10 +61,19 @@ _WORK_KEY = "work"
 _QUORUM = {"x-queue-type": "quorum", "x-delivery-limit": 20}
 
 # How long a republished-and-still-unclaimed job is left alone before the
-# maintenance loop offers it again. Duplicates are harmless but not free, and
-# one delivery is enough: the message waits in the broker until someone claims
-# it, so republishing every tick would only pile up deliveries to discard.
-_REPUBLISH_QUIET = timedelta(seconds=5)
+# maintenance loop offers it again, counted in maintenance passes. Duplicates
+# are harmless but not free, and one delivery is enough: the message waits in
+# the broker until someone claims it, so republishing every tick would only pile
+# up deliveries to discard.
+#
+# Passes rather than seconds, because the damper has to be longer than the loop
+# it damps and only the loop knows its own period. The five seconds this
+# replaces did not: at the thirty-second interval `start()` defaults to,
+# `now - last` was always the larger number, so the `continue` never ran, the
+# prune emptied `_republished` on every pass, and the whole mechanism — dict,
+# damper, prune — did nothing. It was load-bearing only under the test fixture's
+# 40ms interval, which is the one place five seconds was the bigger number.
+_REPUBLISH_QUIET_PASSES = 4
 
 
 class RabbitMQJobQueue:
@@ -88,6 +97,7 @@ class RabbitMQJobQueue:
         self._namespace = namespace
         self._prefetch = prefetch
         self._maintenance_interval = maintenance_interval
+        self._republish_quiet = maintenance_interval * _REPUBLISH_QUIET_PASSES
         self._orphan_after = orphan_after
 
         # Deliveries the consumer has taken but nobody has reserved yet. Bounded
@@ -183,19 +193,29 @@ class RabbitMQJobQueue:
         Whatever is still held goes back to the broker when the channel closes,
         which is the redelivery path this design keeps the deliveries unacked
         for. Nothing is acked on the way out on purpose.
+
+        The connection goes in a `finally` because everything above it can fail
+        against a broker that is having a bad day, and the connection is what
+        registers this object's *consumer*. Leaked, it is not an idle socket: the
+        broker goes on delivering to a consumer no one is reading, and each of
+        those deliveries is unacked and unreachable until the process exits. A
+        teardown that raises would leave a queue looking healthy and answering
+        nobody, which is worse than the failure it is reporting.
         """
-        if self._maintenance is not None:
-            self._maintenance.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._maintenance
-        if delete_queues and self._channel is not None and not self._channel.is_closed:
-            for queue in (self._work, self._delay):
-                if queue is not None:
-                    await queue.delete(if_unused=False, if_empty=False)
-            if self._exchange is not None:
-                await self._exchange.delete()
-        if self._connection is not None:
-            await self._connection.close()
+        try:
+            if self._maintenance is not None:
+                self._maintenance.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._maintenance
+            if delete_queues and self._channel is not None and not self._channel.is_closed:
+                for queue in (self._work, self._delay):
+                    if queue is not None:
+                        await queue.delete(if_unused=False, if_empty=False)
+                if self._exchange is not None:
+                    await self._exchange.delete()
+        finally:
+            if self._connection is not None:
+                await self._connection.close()
 
     # ----------------------------------------------------------------------
     # Producing
@@ -296,12 +316,26 @@ class RabbitMQJobQueue:
         # settled: the fencing check is the thing protecting a result another
         # consumer already recorded, and acking first would throw away the
         # redelivery that consumer is relying on.
-        await self._store.ack(lease, result_ref=result_ref)
-        await self._release(lease.job.id, lease.id)
+        #
+        # Settled either way, though, and that is what the `finally` is for. A
+        # `StaleLease` means this delivery is for a job somebody else has already
+        # finished, so it is void — and nothing else will ever come back for it:
+        # both queries in `_sweep` are predicated on `state == running`, and by
+        # now the row is terminal. Left in `_held` it is an unacked delivery the
+        # broker counts against this channel until the process exits, which at
+        # `prefetch=1` is the whole consumer.
+        try:
+            await self._store.ack(lease, result_ref=result_ref)
+        finally:
+            await self._release(lease.job.id, lease.id)
 
     async def nack(self, lease: Lease, *, error: str, retry_in: timedelta | None = None) -> None:
-        job = await self._store.nack(lease, error=error, retry_in=retry_in)
-        await self._release(lease.job.id, lease.id)
+        # Same shape as `ack`, and the republish below stays inside the success
+        # path: a lease this consumer no longer holds is not its job to reoffer.
+        try:
+            job = await self._store.nack(lease, error=error, retry_in=retry_in)
+        finally:
+            await self._release(lease.job.id, lease.id)
         if job.state is JobState.FAILED:
             # Republished rather than requeued: `basic_nack(requeue=True)` puts
             # the message back at the head with no delay at all, which turns a
@@ -365,7 +399,7 @@ class RabbitMQJobQueue:
             await self._release(job_id)
 
         now = asyncio.get_running_loop().time()
-        quiet = _REPUBLISH_QUIET.total_seconds()
+        quiet = self._republish_quiet.total_seconds()
         for job_id in await self._store.lapsed_reservable():
             await self._release(job_id)
             if now - self._republished.get(job_id, float("-inf")) < quiet:

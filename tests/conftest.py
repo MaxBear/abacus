@@ -76,6 +76,10 @@ _MAINTENANCE = timedelta(milliseconds=40)
 # so a broker blip is not mistaken for a lost job; a test wants it short enough
 # to observe. Both are the same guess at different scales — see `docs/jobs.md`'s
 # first open question.
+#
+# `test_rabbitmq_job_queue.py`'s BEFORE_THE_SWEEP is sized against this and is
+# the only thing in the suite that breaks if it moves: that reserve has to
+# finish inside this window to mean anything.
 _ORPHAN_AFTER = timedelta(milliseconds=150)
 
 # The suite drives one queue object as several competing consumers, so its
