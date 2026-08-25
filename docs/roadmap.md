@@ -20,7 +20,7 @@ rather than invented. See [Open questions](#open-questions) — two of them affe
 | 0 | Skeleton: FastAPI + Postgres + RabbitMQ, health split, prod-shaped image | **done** |
 | 1 | Chat over WebSocket | **done** |
 | 2 | The job broker on RabbitMQ | **done** |
-| 3 | Containerized workers | planned |
+| 3 | Containerized workers | in progress |
 | 4 | The analytics engine, and the LLM gateway | planned, numbering unresolved |
 | 5 | Chat UI | planned |
 | 6 | Cloud | planned |
@@ -123,11 +123,21 @@ that were written down in advance.
 
 ## Phase 3 — containerized workers
 
+In progress. **Designed ahead of the code** in [`worker.md`](worker.md); this section is the
+summary, that document is authoritative.
+
 **What lands.** `worker/` — the job consumer and solver runner (`README.md:59`), as a stateless
 container that pulls work, executes a CPU-bound solve, writes artifacts to object storage, and
 reports terminal state. Object storage becomes a real adapter here. Worker progress events reach
 connected clients through the RabbitMQ fanout described in `websocket.md`, which is also where
 per-replica event queues arrive.
+
+**The shape it takes.** Two processes per container: an `asyncio` supervisor holding the AMQP
+connection and the lease, and a `spawn`ed child doing the solve. A CPU-bound computation cannot
+share a thread with an AMQP heartbeat — RabbitMQ closes a connection after two missed 60-second
+intervals, so a five-minute solve on the event loop is torn down by the broker on the grounds that
+the worker is dead. The same process boundary is what makes cancellation possible at all, since a
+Python thread cannot be interrupted from outside and a process can be signalled.
 
 **Acceptance.** Kill a worker mid-solve; the job is redelivered and completes elsewhere. No partial
 artifact is ever visible as a finished one.
