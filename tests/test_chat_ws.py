@@ -18,9 +18,9 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from api import deps
 from api.main import app
 from core.chat_handler import ConnectionHandler
+from core.chat_repository import Role, Status
 from core.config import Settings
 from core.frames import PROTOCOL_VERSION, Error, ErrorCode, Pong
-from core.repository import Role, Status
 from core.responder import StubResponder
 from core.ws import (
     WS_NORMAL,

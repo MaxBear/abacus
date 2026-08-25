@@ -32,8 +32,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
+from core.chat_repository import Role, Status
 from core.jobs import JobState
-from core.repository import Role, Status
 
 # Explicit constraint naming, set before any table is defined.
 #
@@ -105,7 +105,7 @@ chat_messages = Table(
     # Text plus a check rather than a Postgres enum: adding a state later is then
     # a constraint change instead of a type migration.
     #
-    # Spelled from core.repository's enums so there is one list, not two. Note
+    # Spelled from core.chat_repository's enums so there is one list, not two. Note
     # what this does *not* buy: alembic autogenerate cannot see a CHECK
     # constraint change, so editing an enum still produces an empty migration
     # and the database keeps rejecting the new value until someone hand-writes

@@ -1,4 +1,4 @@
-"""The Postgres implementation of `core.repository.ChatRepository`.
+"""The Postgres implementation of `core.chat_repository.ChatRepository`.
 
 Infrastructure, so it lives here rather than in `core/`: the Protocol is domain,
 the SQL is not. This is what `adapters/postgres/db.py`'s `session()` has been waiting
@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from adapters.postgres.db import Database
 from adapters.postgres.tables import chat_messages, chat_sessions
-from core.repository import RecordedUserMessage, Role, Status, StoredMessage
+from core.chat_repository import RecordedUserMessage, Role, Status, StoredMessage
 
 # The columns a StoredMessage is built from, in one place so the select list and
 # the insert's `returning` cannot drift apart.

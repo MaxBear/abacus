@@ -12,8 +12,8 @@ from fastapi import Depends, Request
 from starlette.requests import HTTPConnection
 
 from adapters.postgres.db import Database
+from core.chat_repository import ChatRepository
 from core.config import Settings
-from core.repository import ChatRepository
 from core.responder import Responder
 from core.ws import ConnectionRegistry
 

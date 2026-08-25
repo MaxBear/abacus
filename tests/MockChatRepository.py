@@ -7,7 +7,7 @@ supported implementation: nothing that ships imports this module.
 import uuid
 from dataclasses import replace
 
-from core.repository import RecordedUserMessage, Role, Status, StoredMessage
+from core.chat_repository import RecordedUserMessage, Role, Status, StoredMessage
 
 
 class MockChatRepository:
