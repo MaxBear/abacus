@@ -96,8 +96,8 @@ async def test_a_consumer_cut_off_mid_job_has_its_work_finished_elsewhere(rabbit
     consumer receives the requeued message straight away and the row refuses it,
     because the dead consumer's lease is still live — so time-to-redelivery is
     set by the lease, not by the channel closing. The broker's guarantee is
-    necessary and not sufficient, and `docs/benchmark.md` should measure the
-    lease rather than the socket.
+    necessary and not sufficient — anything asking how fast a killed job comes
+    back is measuring the lease, not the socket.
     """
     settings = get_settings()
     adapter = rabbitmq_queue._queue

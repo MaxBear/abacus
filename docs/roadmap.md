@@ -19,7 +19,7 @@ rather than invented. See [Open questions](#open-questions) — two of them affe
 | --- | --- | --- |
 | 0 | Skeleton: FastAPI + Postgres + RabbitMQ, health split, prod-shaped image | **done** |
 | 1 | Chat over WebSocket | **done** |
-| 2 | The job broker, built twice and benchmarked | in progress |
+| 2 | The job broker on RabbitMQ | **done** |
 | 3 | Containerized workers | planned |
 | 4 | The analytics engine, and the LLM gateway | planned, numbering unresolved |
 | 5 | Chat UI | planned |
@@ -80,36 +80,46 @@ a way no reconnect logic repairs. Deciding this at 1a is what lets backpressure 
 connection and lets the phase-3 fan-out bus be lossy — both are cheap only because durability sits
 underneath them.
 
-## Phase 2 — the job broker, built twice
+## Phase 2 — the job broker on RabbitMQ
 
-In progress. **The contract, the lease semantics, and the benchmark methodology are settled** in
-[`jobs.md`](jobs.md), written ahead of either implementation; this section is the summary, that
-document is authoritative.
+Done. **The contract and the lease semantics are settled** in [`jobs.md`](jobs.md), written ahead of
+the implementation; this section is the summary, that document is authoritative.
 
-The centerpiece. It is the only phase the README's roadmap line emphasizes, and the reason the
-project describes itself as a cloud-to-scheduler bridge.
+The centerpiece, and the reason the project describes itself as a cloud-to-scheduler bridge. It is
+also the first of this repo's two learning goals: how RabbitMQ and distributed messaging behave in
+the context of a job scheduler. (The second is AI integration, which is phase 4.)
 
-**What lands.** A `JobQueue` Protocol in `core/` — `README.md:58` already reserves the slot — with
-two complete implementations behind it: one on Postgres (`SELECT … FOR UPDATE SKIP LOCKED`), one on
-RabbitMQ. Both must satisfy the same contract and the same test suite. Then a benchmark that makes
-the comparison concrete rather than folkloric.
+**What landed.** A `JobQueue` Protocol in `core/`, the `jobs` table as the system of record behind
+it, and a RabbitMQ implementation on quorum queues — leases as row timestamps, fencing on a lease
+token, retry through a per-message-TTL delay queue and a dead-letter exchange, and the two periodic
+repairs the broker-plus-table split makes necessary. `MemoryJobQueue` in `tests/` is the reference
+semantics and the second implementation.
 
-**Acceptance.** One suite, run twice, once per implementation — that both pass unmodified *is* the
-proof the Protocol is a real seam. Plus a benchmark report committed to `docs/`.
+**Acceptance, met.** One suite, run twice — `tests/test_job_queue.py` is parametrized over `memory`
+and `rabbitmq`, 35 contract tests apiece, and that both pass *unmodified* is the proof the Protocol
+is a real seam. What a fake cannot falsify — competing consumers under a genuine race, redelivery
+after a consumer is cut off mid-job, the dual write's repair — is asserted separately in
+`tests/test_rabbitmq_job_queue.py`.
 
-**The decision it forces.** When a database is a sufficient queue and when it is not. The received
-answer is "never use your database as a queue," which is repeated far more often than it is measured;
-`SKIP LOCKED` is genuinely good, and it buys transactional enqueue with the job's own state — no
-dual-write, no outbox. Against that, RabbitMQ brings real delivery semantics and does not consume
-connection-pool slots. Jobs here are 30 seconds to five minutes and low-rate, which is exactly the
-regime where the folklore is least likely to apply. Building both and measuring is the point.
+**Not built: a Postgres `JobQueue`, and the benchmark comparing the two.** Deliberately, and not as
+a cut for time. This repo exists to learn RabbitMQ and distributed messaging, and a
+`SELECT … FOR UPDATE SKIP LOCKED` implementation would have taught neither — it is the *absence* of
+a broker, which is the thing being studied. A backend bake-off is a different project.
 
-**Settled: the benchmark's methodology**, in [`jobs.md`](jobs.md#the-benchmark), before either
-implementation exists — since a benchmark designed after the fact confirms whatever was built first.
-The framing that makes it decision-shaped: at 30-second-to-five-minute jobs, throughput is not the
-binding constraint, so what is measured is enqueue-to-reserve latency, the database's cost while
-*idle*, time-to-redelivery after a hard kill, and the consumer count at which p99 knees. The
-thresholds that would flip the recommendation are written down in advance.
+**The decision it forced,** which survives without the measurement: when a database is a sufficient
+queue and when it is not. The received answer is "never use your database as a queue," repeated far
+more often than it is measured; `SKIP LOCKED` is genuinely good, and buys transactional enqueue with
+the job's own state — no dual write, no outbox. Against that, RabbitMQ brings real delivery
+semantics and does not consume connection-pool slots. Jobs here are 30 seconds to five minutes and
+low-rate, exactly the regime where the folklore is least likely to apply.
+
+That argument is not hypothetical here, because building the RabbitMQ side made its costs
+executable rather than rhetorical. `_maintain`'s two periodic Postgres queries exist *only* because
+the broker cannot answer what a row can: it has no per-message deadline, so a lapsed lease has to be
+polled for, and it cannot enlist in a transaction, so a dual write has to be swept for. The
+comparison's conclusion is in the code, in a form a benchmark report could not have delivered — and
+[`jobs.md`](jobs.md#the-benchmark) keeps the measurement's design, unrun, including the thresholds
+that were written down in advance.
 
 ## Phase 3 — containerized workers
 
@@ -222,10 +232,11 @@ rest can wait for the phase that needs them.
 
 1. **Phase 4's numbering** — analytics engine and LLM gateway currently share the number. Split into
    4a/4b, or renumber 5 and 6 upward?
-2. ~~**Phase 2's benchmark methodology**~~ — settled in [`jobs.md`](jobs.md#the-benchmark). What
-   replaced it are narrower phase-2 questions, listed in that document's Open section: whether phase
-   2 lands a real `worker/` or only a harness consumer, quorum versus classic queues, and whether a
-   lease duration is per-call or per-queue.
+2. ~~**Phase 2's benchmark methodology**~~ — settled in [`jobs.md`](jobs.md#the-benchmark), then
+   not run: the Postgres implementation it would compare against is out of scope, so there is
+   nothing to compare. The design and its decision thresholds are kept as a record of what would
+   have been measured. The narrower phase-2 questions that replaced it are in that document's Open
+   section; quorum versus classic and the lease's granularity are both settled there now.
 3. **Where the phase-5 UI is served from** — decides cookie versus ticket for WebSocket auth, which
    `websocket.md` is holding open.
 4. **Whether `verify-phase0.sh` generalizes** to `verify.sh <phase>` once phase 1 has acceptance

@@ -20,11 +20,13 @@ architecture of an LLM agent driving real computation, and the reason this proje
 
 ## Status
 
-**Phase 0 — skeleton.** FastAPI + Postgres + RabbitMQ under compose, with the liveness/readiness
-split and a production-shaped Dockerfile. No jobs, no agent, no frontend yet.
+**Phase 2 — the job broker.** A `JobQueue` Protocol in `core/`, the `jobs` table behind it, and a
+RabbitMQ implementation on quorum queues: leases, fencing, retry through a delay queue, and the
+periodic repairs a broker-plus-table split needs. No agent and no frontend yet, and `worker/` is
+still empty — phase 3 is what fills it.
 
-Roadmap: `1` chat over WebSocket → **`2` the job broker, built twice (Postgres and RabbitMQ,
-benchmarked)** → `3` containerized workers → `4` the analytics engine → `5` chat UI → `6` cloud.
+Roadmap: `1` chat over WebSocket → **`2` the job broker on RabbitMQ** → `3` containerized workers →
+`4` the analytics engine → `5` chat UI → `6` cloud.
 
 [`docs/roadmap.md`](docs/roadmap.md) gives each phase what it lands, how it is accepted, and the
 decision it forces. Phase 1's transport is designed ahead of the code in

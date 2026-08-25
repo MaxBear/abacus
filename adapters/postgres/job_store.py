@@ -281,7 +281,8 @@ class PostgresJobStore:
         already made is not something it will reconsider. So the caller polls
         this and republishes — which is the concrete shape of `docs/jobs.md`'s
         finding that making RabbitMQ safe means running a small Postgres queue
-        beside it. The benchmark has to count this query, not just the sweep.
+        beside it. This query and the sweep are that queue, and there are only
+        the two of them.
 
         Deliberately read-only. The row is left exactly as it is so that a
         consumer whose lease lapsed while nobody wanted the job can still `ack`

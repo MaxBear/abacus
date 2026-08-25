@@ -1,10 +1,10 @@
 """Phase 2: the queue contract, run once per implementation.
 
-Parametrized over `queue` so that adding Postgres and RabbitMQ later is a param
-and a fixture, not a second copy of this file. That both implementations pass
-this suite *unmodified* is the phase's actual deliverable — a Protocol nobody
-has implemented twice is a guess, and a suite rewritten to accommodate the
-second implementation has stopped being evidence. See `docs/jobs.md`.
+Parametrized over `queue` so that a second implementation is a param and a
+fixture, not a second copy of this file. That both implementations pass this
+suite *unmodified* is the phase's actual deliverable — a Protocol nobody has
+implemented twice is a guess, and a suite rewritten to accommodate the second
+implementation has stopped being evidence. See `docs/jobs.md`.
 
 `memory` always runs; `rabbitmq` skips itself when no broker or database
 answers, so `make test` stays container-free and `make up` turns the rest on with

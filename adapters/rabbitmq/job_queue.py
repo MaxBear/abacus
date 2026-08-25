@@ -16,9 +16,10 @@ What the split costs is the interesting part, and it is all visible here:
   and the delivery just stays unacked.
 - **Nothing notices a lapsed lease**, for the same reason, so `_maintain` polls
   Postgres for them and republishes. That loop and the sweep are two periodic
-  database queries that the Postgres implementation would not need — which is
-  `docs/jobs.md`'s thesis showing up as code rather than as an opinion, and what
-  the benchmark has to count.
+  database queries that a `SKIP LOCKED` implementation would not need — which is
+  `docs/jobs.md`'s thesis showing up as code rather than as an opinion, and the
+  reason that document's benchmark was never worth running: the cost it set out
+  to measure is legible here without a number attached to it.
 
 The delivery is held unacked from `reserve` until `ack`/`nack` deliberately. It
 buys the one redelivery guarantee that is genuinely the broker's: a consumer

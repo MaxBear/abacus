@@ -1,19 +1,37 @@
-# Phase 2 — the job broker, built twice
+# Phase 2 — the job broker on RabbitMQ
 
-Draft, and design-first for the same reason [`websocket.md`](websocket.md) was: the point of this
-phase is a *comparison*, and a benchmark designed after the fact confirms whatever was built first.
-[`roadmap.md`](roadmap.md) says as much in its own open question. So the contract, the semantics, and
-the measurement are settled here before either implementation exists.
+Design-first for the same reason [`websocket.md`](websocket.md) was: the contract and the semantics
+are settled here before the implementation, so that what got built can be checked against what was
+argued rather than the other way round.
 
-The phase's question, in one line: **when is a database a sufficient queue, and when is it not?**
-The received answer — "never use your database as a queue" — is repeated far more often than it is
+**A note on what this document was, and is.** It was written as a *comparison* — two
+implementations, Postgres and RabbitMQ, and a benchmark to decide between them. That is not what
+this repo is for. Abacus exists to learn two things: how RabbitMQ and distributed messaging behave
+in the context of a job scheduler, and (from phase 4) AI integration. A
+`SELECT … FOR UPDATE SKIP LOCKED` queue teaches neither — it is the *absence* of a broker, which is
+the thing under study. So there is no `PostgresJobQueue` and no `docs/benchmark.md`, and this is not
+a deferral: a backend bake-off is a different project.
+
+What survives is the reasoning, which is worth more here than the measurement would have been. The
+phase's question, in one line: **when is a database a sufficient queue, and when is it not?** The
+received answer — "never use your database as a queue" — is repeated far more often than it is
 measured. `SELECT … FOR UPDATE SKIP LOCKED` is genuinely good and buys transactional enqueue with
 the job's own state. RabbitMQ buys real delivery semantics and does not spend connection-pool slots.
 Jobs here run 30 seconds to five minutes at a low rate, which is precisely the regime where the
 folklore is least likely to apply.
 
-Building both and measuring is the deliverable. **Two implementations, one Protocol, one suite run
-twice** — that both pass unmodified *is* the proof the seam is real.
+That question turned out to be answerable from the build. Every place below that says "and this is
+what the split costs" is a claim the RabbitMQ implementation had to make good on in code, and the
+bill arrived in a legible form: `_maintain`'s two periodic Postgres queries exist *only* because the
+broker cannot answer what a row can. It has no per-message deadline, so a lapsed lease has to be
+polled for; it cannot enlist in a transaction, so a dual write has to be swept for. Sections marked
+**[not built]** are the parts of the original comparison that were specified and then deliberately
+not carried out; they are kept because the reasoning in them is the finding.
+
+**One Protocol, one suite run twice** remains the deliverable, and is met: `MemoryJobQueue` and the
+RabbitMQ adapter both pass `tests/test_job_queue.py` unmodified, 35 tests apiece. A Protocol nobody
+has implemented twice is a guess, and the second implementation being a fake does not weaken that —
+the fake is the reference semantics, and it is the one that has to be argued with.
 
 ## What a queue is here: pull, with a lease
 
@@ -402,10 +420,12 @@ because the shortcut would quietly convert the comparison into a comparison of P
 > has a documented head-of-line blocking hazard. The ladder is the recommendation; it is also an
 > admission that this is harder than the column.
 
-## Waiting: poll, or `LISTEN`/`NOTIFY`?
+## Waiting: poll, or `LISTEN`/`NOTIFY`? **[not built]**
 
-The Postgres implementation has to decide how `reserve(wait_for=…)` waits, and it changes what the
-benchmark measures.
+The Postgres implementation would have had to decide how `reserve(wait_for=…)` waits, and it would
+have changed what the benchmark measured. Kept because the trade is the clearest small illustration
+of what a broker is actually selling: RabbitMQ has no version of this question, since a consumer
+that is not being handed work is simply a socket nobody is writing to.
 
 - **Poll on an interval.** One indexed query per consumer per tick. Simple, obvious, and the thing
   everyone assumes is expensive. At 16 consumers on a 1-second tick that is 16 queries a second — of
@@ -415,15 +435,24 @@ benchmark measures.
   `NOTIFY` delivered while a listener was reconnecting is simply lost and `run_after` jobs have no
   `NOTIFY` to deliver.
 
-**Recommendation: build the polling implementation, and make the poll interval the benchmark's
-independent variable.** "How much does idle polling actually cost?" is the question the folklore
-answers loudest and measures least. `LISTEN`/`NOTIFY` is then a documented, measured improvement if
-the numbers say latency matters — and if they do not, that null result is worth more than the
-optimization.
+**The recommendation was: build the polling implementation, and make the poll interval the
+benchmark's independent variable.** "How much does idle polling actually cost?" is the question the
+folklore answers loudest and measures least. Unanswered here, and worth naming as unanswered — it is
+the one claim in this document that the build could not settle, because nothing in the RabbitMQ path
+polls a database on a per-consumer basis. What it polls instead is `_maintain`, once per process,
+which is a strictly smaller version of the same cost and the honest comparison nobody runs.
 
-## The benchmark
+## The benchmark **[not built]**
 
-`roadmap.md`'s second open question, answered. The framing that makes it decision-shaped:
+`roadmap.md`'s second open question, answered as a design and then deliberately not run: with no
+Postgres implementation there is nothing to compare against. It is kept in full, unedited except for
+this note, for two reasons. The thresholds below were written down *before* either implementation
+existed, which is the only condition under which a benchmark's thresholds mean anything — deleting
+them now would destroy the one property that made them credible. And the metric list is a decent
+account of what actually matters for this workload, which outlived the comparison it was designed
+for.
+
+The framing that makes it decision-shaped:
 
 > **At 30-second-to-five-minute jobs, throughput is not the binding constraint. The cost of *waiting*
 > is.** A queue that dequeues 10,000 jobs/sec is irrelevant when the workers can start twelve of them
@@ -479,9 +508,9 @@ Written down in advance, so it cannot be adjusted to fit what is measured:
   the folklore does not apply at this scale. That is a legitimate and likely outcome, and the report
   says so plainly.
 
-The report lands as `docs/benchmark.md` with the raw numbers, the harness invocation, and the
-hardware it ran on — which is a laptop under Docker Desktop, stated as a limitation rather than
-implied to be a datacenter.
+The report would have landed as `docs/benchmark.md` with the raw numbers, the harness invocation,
+and the hardware it ran on — a laptop under Docker Desktop, stated as a limitation rather than
+implied to be a datacenter. That file does not exist and will not.
 
 ## What the socket sees
 
@@ -521,31 +550,38 @@ a flag is slower and less impressive, and it is the version that survives the ph
 
 One concern per PR, as in phase 0 and 1b.
 
-1. **`core/jobs.py`** — the Protocol, `JobRequest`/`Job`/`Lease`, `JobState`. No infrastructure;
-   `test_layering.py` covers it the moment it exists.
-2. **An in-memory implementation plus the shared contract suite.** The fake is not a test double
-   here, it is the third implementation and the reference semantics — and it is what keeps `make
-   test` container-free while the contract is being argued.
-3. **The `jobs` table**, as one Alembic revision.
-4. **`adapters/postgres/job_queue.py`** — `SKIP LOCKED`, leases, expiry-as-predicate. Same suite,
-   marked `postgres`, skipping when nothing answers.
-5. **`adapters/rabbitmq/job_queue.py`** — quorum queues, consumer at prefetch 1, DLX+TTL retry
-   ladder, and the dual write with its `published_at` sweep. Same suite, marked `rabbitmq`. The
-   sweep gets its own test: publish is stubbed to fail, and the job still runs.
-6. **The benchmark harness and `docs/benchmark.md`.**
-7. **`job_status` and narrowed `cancel`** on the wire, additive under `v1`.
+1. ~~**`core/jobs.py`**~~ — the Protocol, `JobRequest`/`Job`/`Lease`, `JobState`. No infrastructure;
+   `test_layering.py` covers it. **(#7)**
+2. ~~**An in-memory implementation plus the shared contract suite.**~~ The fake is not a test double
+   here, it is the reference semantics — and it is what keeps `make test` container-free while the
+   contract is being argued. **(#7)**
+3. ~~**The `jobs` table**~~, as one Alembic revision, plus `PostgresJobStore`: every statement
+   against it, and no policy about how work is handed out. **(#8)**
+4. ~~**`adapters/postgres/job_queue.py`**~~ — **out of scope**, see the note at the top. The store
+   from step 3 is what a polling implementation would have been built on, which is why the two were
+   split; that split earned its keep anyway, by keeping the RabbitMQ adapter from becoming a second
+   copy of the semantics.
+5. ~~**`adapters/rabbitmq/job_queue.py`**~~ — quorum queues, consumer at prefetch 1, DLX+TTL retry,
+   and the dual write with its `published_at` sweep. Same suite, marked `rabbitmq`. The sweep got
+   its own test: publish is stubbed to fail, and the job still runs. **(#8)**, with four defects
+   found in review and fixed in **#9** — a delivery leaked on a stolen lease, a connection leaked on
+   a failed teardown, a republish damper that was inert at its own default interval, and a test
+   constant named after nothing.
+6. ~~**The benchmark harness and `docs/benchmark.md`.**~~ — **out of scope**, see above.
+7. **`job_status` and narrowed `cancel`** on the wire, additive under `v1`. Still open; it is the
+   one piece of phase 2 that phase 3 needs and phase 5 consumes.
 
-Steps 4 and 5 are the phase. Step 2 is what makes them comparable, and it comes first because a
-contract nobody has implemented twice is a guess.
+Step 5 was the phase. Step 2 is what made it checkable, and it came first because a contract nobody
+has implemented twice is a guess.
 
 ## Testing
 
 The suite is parametrized over implementations and run once per implementation, with the in-memory
-one always on and the other two skipping when their service is unreachable — extending
+one always on and the RabbitMQ one skipping when its services are unreachable — extending
 `conftest.py`'s existing pattern rather than inventing a second one. `make test` stays container-free
 and `make up` turns the rest on with no flag to remember.
 
-What the contract suite has to prove, on all three:
+What the contract suite has to prove, on both:
 
 - **A reserved job is not reserved again** while its lease holds, under concurrent consumers.
 - **A lease that expires makes the job reservable again**, exactly once.
@@ -559,8 +595,10 @@ What the contract suite has to prove, on all three:
 And two that need real infrastructure, because a fake cannot falsify them — the same argument
 `persistence.md` makes about gap-free `seq`:
 
-- **`SKIP LOCKED` under a genuine race:** N consumers claim concurrently, every job goes to exactly
-  one, nobody blocks.
+- **Competing consumers under a genuine race:** N consumers claim concurrently, every job goes to
+  exactly one, nobody blocks. Under RabbitMQ this is the broker's dispatch plus the claim being a
+  conditional `update`, which is the same guarantee `SKIP LOCKED` would have provided from the other
+  side of the seam.
 - **Redelivery after a hard kill:** `SIGKILL` a consumer holding a lease, assert the job completes
   elsewhere. This is phase 2's half of phase 3's acceptance criterion, testable early because the
   synthetic worker is under the test's control.
@@ -573,8 +611,11 @@ rather than fails when redelivery never happens. Every wait gets `asyncio.wait_f
 Decided 2026-08-20, recorded here so the reasoning outlives the conversation:
 
 - **The consumer is a mock worker**, standing to the phase-3 worker as `StubResponder` does to the
-  phase-4 gateway. `worker/` stays empty. The synthetic solver is throwaway on purpose.
-- **Quorum queues**, not classic — the comparison is worth having against RabbitMQ's real default.
+  phase-4 gateway. Decided for the benchmark, which is not being run; it held anyway, because the
+  contract suite needed exactly the same thing. `worker/` stays empty until phase 3.
+- **Quorum queues**, not classic. Originally "the comparison is worth having against RabbitMQ's real
+  default"; the reason is now simply that learning the default is the point, and most writeups that
+  claim to have used RabbitMQ quietly used classic on one node.
 - **`lease` is a per-call argument.** Queue-level is the weaker option, not the more advanced one.
 - **`cancel` lands as a state transition plus a polled `cancel_requested` flag.** Interrupting a
   worker blocked inside a numpy call stays phase 3.
@@ -588,7 +629,18 @@ Decided 2026-08-20, recorded here so the reasoning outlives the conversation:
 - **The RabbitMQ dual write is repaired, not accepted** — with a `published_at` column and a sweep
   rather than a full outbox. Only one of its three failure modes can actually lose a job, and the
   other two are already absorbed by the claim being a conditional `update`. The repair is an outbox
-  collapsed into the `jobs` table, and what it cost is itself the finding.
+  collapsed into the `jobs` table: the message body is the row's primary key, so there is nothing to
+  copy into a second table, and "not sent yet" is one nullable column with a partial index on it.
+  What it cost is itself the finding.
+- **What the split cost, in defects.** Recorded 2026-08-25, after the first review of the finished
+  adapter (#9). Four, and three of them exist *only* because the broker's view and the row's can
+  disagree: a delivery leaked whenever `ack` found its lease stolen, because the row said the job
+  was over while the broker still held the message; a republish damper measured in seconds against a
+  loop measured in seconds, inert at its own default; and a teardown that leaked a live consumer
+  when the broker refused to delete a queue. (The fourth was an ordinary `try/finally` omission.)
+  None of the three has an analogue in a `SKIP LOCKED` implementation, where there is no second
+  system to disagree with. This is the benchmark's conclusion arriving as bugs instead of numbers —
+  less quotable, harder to argue with, and free.
 
 ## Open
 
@@ -597,7 +649,10 @@ Questions the repo cannot answer on its own.
 1. **The sweep's two constants** — every 30 seconds, for jobs unpublished after 2 minutes — are
    guesses, and the second one is the one that matters: too low and it republishes during a broker
    blip the publish would have survived, too high and a lost job stays lost that much longer.
-   Worth setting against a measured publish latency rather than by feel.
+   Worth setting against a measured publish latency rather than by feel. The 30 seconds turned out
+   to have a second consequence nobody had priced: it also sets the republish damper, which is now
+   derived from it (`_REPUBLISH_QUIET_PASSES` passes of the loop) rather than being an absolute
+   duration that could be — and for a while silently was — smaller than the interval it damped.
 2. **Retention.** `jobs` grows without bound, exactly as `chat_messages` does. Same open question,
    and probably the same eventual answer, but the payload here is `jsonb` and much larger.
 3. **Does `cancel` need an idempotency key?** It is a state transition, so it is naturally idempotent
