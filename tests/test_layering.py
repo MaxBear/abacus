@@ -34,6 +34,7 @@ BANNED = {
     "fastapi",
     "adapters",
     "api",
+    "worker",
 }
 
 
