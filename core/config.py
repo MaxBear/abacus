@@ -65,6 +65,38 @@ class Settings(BaseSettings):
 
     s3_bucket: str = "abacus-artifacts"
 
+    # --- The worker (docs/worker.md) ---
+
+    # How long a claim is good for. The supervisor extends it on a timer while a
+    # child runs, so this is not the length of a solve — it is how long the job
+    # is unavailable to anyone else after this worker stops saying anything at
+    # all. Short enough that a dead worker's job is picked up promptly, long
+    # enough that a database blip is not immediately a lost lease.
+    worker_lease_seconds: float = 60.0
+
+    # The heartbeat, comfortably inside the lease so a slow `extend` is not
+    # itself the thing that loses the job: two consecutive failures still leave
+    # a third attempt before the deadline.
+    worker_extend_interval_seconds: float = 20.0
+
+    # The wall-clock cap the lease cannot express. A supervisor that is healthy
+    # while its child is wedged extends forever and the row looks permanently
+    # `running`; past this the child is killed and the job fails with a real
+    # error. Twice the five-minute solve `docs/worker.md` sizes everything else
+    # against.
+    worker_solve_timeout_seconds: float = 600.0
+
+    # Between SIGTERM and SIGKILL — layer 2 before layer 3.
+    worker_grace_seconds: float = 5.0
+
+    # How long one `reserve` waits before returning empty-handed. The loop asks
+    # again immediately, so this is only how often an idle worker speaks.
+    worker_reserve_wait_seconds: float = 5.0
+
+    # The backoff on a failed solve. Nonzero for the reason `JobQueue.nack`
+    # gives: an instant retry of a deterministic error is a hot loop.
+    worker_retry_backoff_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:
