@@ -11,11 +11,8 @@ being asserted is what MinIO does rather than what this code intends.
 import uuid
 
 import pytest
-from botocore.exceptions import EndpointConnectionError
 
-from adapters.s3.object_store import S3ObjectStore
 from core.artifacts import ArtifactNotFound, artifact_key
-from core.config import get_settings
 
 
 def test_two_attempts_at_one_job_never_share_a_key():
@@ -42,17 +39,6 @@ def test_a_key_is_the_same_every_time_it_is_asked_for():
 
 
 @pytest.fixture
-def written_keys() -> list[str]:
-    """Keys a test minted, for the `store` fixture to delete afterwards.
-
-    The same shape as `conftest.py`'s `created_sessions`, and for the same
-    reason: a test and the fixture that cleans up after it both append to one
-    registry, and the fixture reads it during teardown.
-    """
-    return []
-
-
-@pytest.fixture
 def a_key(written_keys):
     """Mint an artifact key and register it for cleanup.
 
@@ -71,36 +57,6 @@ def a_key(written_keys):
         return key
 
     return make
-
-
-@pytest.fixture
-async def store(written_keys):
-    """A store on real MinIO, or a skip when nothing answers.
-
-    Kept here rather than in `conftest.py` because one module wants it — that
-    file's own rule. It moves the day the supervisor's tests need it too.
-    """
-    settings = get_settings()
-    store = await S3ObjectStore.start(settings)
-    # Everything after `start` is inside this, including the skip: the client
-    # holds an aiohttp session, and the reachability probe is not the only thing
-    # that can fail here. `head_bucket` under scoped credentials answers
-    # `AccessDenied`, which is a `ClientError` and would otherwise leave the
-    # session open for the rest of the run.
-    try:
-        try:
-            await store.ensure_bucket()
-        except (EndpointConnectionError, OSError):
-            pytest.skip("no object store reachable — `make up`, and S3_ENDPOINT_URL in .env")
-        yield store
-    finally:
-        # The bucket is shared across runs and nothing lists it, so a test that
-        # does not clean up after itself leaves an object no later run can even
-        # find. Cheaper than a bucket per run, and unlike the RabbitMQ fixture's
-        # topology there is nothing here for a leftover to race with.
-        for key in written_keys:
-            await store.delete(key)
-        await store.close()
 
 
 @pytest.mark.s3
