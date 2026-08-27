@@ -22,7 +22,8 @@ A worker container is **two processes**, not one.
 
 - **The supervisor** owns the AMQP connection, the `RabbitMQJobQueue`, the lease, and the clock. It
   is `asyncio` and it never computes anything.
-- **The solve child** is a separate OS process. It computes, writes its artifact, and exits.
+- **The solve child** is a separate OS process. It computes, returns bytes, and exits. It does
+  not write to object storage: the supervisor does, between the extend loop and the `ack`.
 
 The obvious alternative — one process, solve inside `run_in_executor` — fails twice, and the two
 failures are worth separating because only one of them is about the GIL.
@@ -46,8 +47,9 @@ decision and not two.
 
 `multiprocessing` with an explicit `spawn` start method, not `fork`: a forked child inherits the
 parent's asyncio loop, its open AMQP socket, and its Postgres pool, all in a state no library
-promises to survive duplication. The child needs none of them. It receives a job payload and a
-destination, and returns a result or dies.
+promises to survive duplication. The child needs none of them, and is given none of them — not
+even S3 credentials, since it never writes. It receives a job payload and returns a result or
+dies, over one pipe carrying exactly one message.
 
 ## The lease, extended for real
 
@@ -230,6 +232,10 @@ redelivered" hangs rather than fails when redelivery never happens.
 - **Two processes, `spawn`, not a thread pool.** The event loop must keep scheduling, and a solve
   must be killable; one boundary buys both.
 - **The artifact key carries the lease id**, so competing attempts never share a destination.
+- **The child returns bytes; the supervisor writes them.** The only `ObjectStore` is async and
+  belongs to the loop the child does not have, and a child that wrote would need a credential
+  this design otherwise never grants it. The cost is that an artifact crosses a pipe, which
+  `worker/process.py` pays for by reading it on a thread.
 - **Write, then ack.** Orphans are a cost; dangling pointers are a bug.
 - **No checkpointing.** A five-minute solve restarts from zero, and the alternative is a second dual
   write plus the fencing argument again.
