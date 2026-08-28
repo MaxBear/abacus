@@ -8,7 +8,8 @@ securities. Market data comes from free public sources (Stooq, FRED).
 
 ## What this actually is
 
-A **cloud-to-scheduler bridge**, with a numerical solver where an HPC scheduler would normally sit.
+A **durable handoff between a websocket and a pool of workers.** Postgres is the system of
+record for both chat transcripts and job state. The broker distributes jobs.
 
 The LLM performs zero calculation. It turns English into an `AnalysisRequest`, decides which analysis
 answers the question, and explains the result afterward. A job broker hands the work to a stateless
