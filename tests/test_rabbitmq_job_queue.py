@@ -222,6 +222,122 @@ async def test_losing_the_lease_race_does_not_cost_a_consumer_its_prefetch_slot(
         await slow.close(delete_queues=True)
 
 
+async def test_discard_returns_the_slot_of_a_consumer_that_reports_nothing(rabbitmq_queue):
+    """The same wedge as above, reached from the one path that calls neither.
+
+    `ack` and `nack` release the delivery in a `finally`, so a loser that tries
+    to report gets its slot back even though the row refuses it. The supervisor's
+    `Ending.STALE` never tries: the job is being solved by somebody else right
+    now, so writing anything would land on work in progress. That correct silence
+    is what leaves the delivery held, and `discard` is the verb for it.
+
+    Note what is asserted about the row — nothing changed. The winner is still
+    mid-solve and still holds its lease *after* the loser has cleaned up, which
+    is the half that makes this different from an `ack` arriving late.
+    """
+    settings = get_settings()
+    store = rabbitmq_queue._queue._store
+    namespace = f"test-{uuid.uuid4().hex[:12]}"
+
+    # As above: alive, merely slow, and with a maintenance interval long enough
+    # that a sweep of its own never releases the delivery for it. That window is
+    # where this bug hides — recovery must not depend on losing a race twice.
+    slow = await RabbitMQJobQueue.start(
+        store=store,
+        url=settings.broker_url,
+        namespace=namespace,
+        prefetch=1,
+        maintenance_interval=timedelta(seconds=30),
+        orphan_after=timedelta(seconds=30),
+    )
+    try:
+        thief = await RabbitMQJobQueue.start(
+            store=store,
+            url=settings.broker_url,
+            namespace=namespace,
+            prefetch=4,
+            maintenance_interval=timedelta(milliseconds=40),
+            orphan_after=timedelta(seconds=30),
+        )
+        try:
+            job = await slow.enqueue(a_request())
+            lost = await slow.reserve(owner="slow", lease=LEASE, wait_for=PATIENT)
+            assert lost is not None and lost.job.id == job.id
+
+            stolen = await thief.reserve(owner="thief", lease=PATIENT, wait_for=PATIENT)
+            assert stolen is not None and stolen.job.id == job.id
+            assert stolen.id != lost.id
+
+            # How the loser finds out, and the whole of what it is told: the
+            # heartbeat is the supervisor's only channel for this.
+            with pytest.raises(StaleLease):
+                await slow.extend(lost, LEASE)
+
+            await slow.discard(lost)
+
+            # The winner is untouched and still working. `discard` reached no
+            # further than this consumer's own channel.
+            assert (await slow.get(job.id)).state is JobState.RUNNING
+            await thief.extend(stolen, PATIENT)
+
+            await thief.ack(stolen, result_ref="s3://bucket/key")
+        finally:
+            # Out of the way, so the next delivery has one place to go.
+            await thief.close()
+
+        # The point of all of it. Without the `discard` above this reserve
+        # returns `None` — for this process, forever.
+        second = await slow.enqueue(a_request())
+        picked = await slow.reserve(owner="slow", lease=PATIENT, wait_for=PATIENT)
+        assert picked is not None and picked.job.id == second.id
+    finally:
+        await slow.close(delete_queues=True)
+
+
+async def test_discard_of_a_superseded_lease_leaves_the_new_delivery_alone(rabbitmq_queue):
+    """The guard that lets `discard` settle without asking the database first.
+
+    One object can end up holding two claims on one job, because `_held` is
+    per consumer and the sweep that republishes a lapsed job may be this very
+    object's. Above `prefetch=1` it then has a free slot, takes the new delivery,
+    and overwrites its own entry. A `discard` of the older lease arriving after
+    that must settle nothing: acking the newer delivery would hand back a slot
+    still in use and spend the redelivery a channel close would otherwise give
+    it — the one guarantee this design keeps deliveries unacked for.
+
+    Fenced on the token rather than on a fresh read of the row, for the reason
+    `_fencing` gives: the token is what a consumer was handed, and a second look
+    at the database would only be a second chance to be told something that has
+    already changed again.
+
+    White-box on `_held`, which is the point. The state this protects is this
+    object's alone, so there is no arrangement of `reserve` and `ack` that can
+    observe it from outside — and at the worker's own `prefetch=1` the condition
+    cannot arise at all, which is exactly how it would go unnoticed.
+    """
+    queue = rabbitmq_queue._queue
+    job = await rabbitmq_queue.enqueue(a_request())
+
+    lost = await rabbitmq_queue.reserve(owner="w1", lease=LEASE, wait_for=PATIENT)
+    assert lost is not None
+    # The sweep republishes the lapsed job and this same object takes it again:
+    # the fixture's prefetch is 16, so holding the first delivery costs it
+    # nothing. `_held` now carries the newer lease.
+    winner = await rabbitmq_queue.reserve(owner="w2", lease=PATIENT, wait_for=PATIENT)
+    assert winner is not None and winner.id != lost.id
+    assert queue._held[job.id][0] == winner.id
+
+    await rabbitmq_queue.discard(lost)
+
+    # Untouched: still the winner's delivery, still unacked.
+    assert queue._held[job.id][0] == winner.id
+
+    # And still settleable by the consumer that owns it, which is what the
+    # prefetch slot and the redelivery both depend on.
+    await rabbitmq_queue.ack(winner, result_ref="s3://bucket/key")
+    assert job.id not in queue._held
+
+
 async def test_a_teardown_that_fails_still_drops_the_connection(rabbitmq_queue, monkeypatch):
     """`close` reports the failure, but not instead of closing.
 

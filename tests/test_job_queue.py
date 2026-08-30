@@ -350,6 +350,58 @@ async def test_a_late_lease_nobody_took_is_still_usable(queue):
     assert (await queue.get(job.id)).state is JobState.DONE
 
 
+async def test_discard_gives_up_a_claim_without_touching_the_job(queue):
+    """Let go of what the *queue* holds, and decide nothing about the *job*.
+
+    A live claim, deliberately, and not the stolen one that motivates the verb.
+    The steal cannot be staged here at all: the maintenance sweep that hands the
+    job to the winner releases the loser's delivery on its way past, so by the
+    time this file could call `discard`, there is nothing left to release and the
+    call is inert. A claim still held is the only shape that reaches an
+    implementation's release path — on RabbitMQ, an actual `basic_ack`.
+
+    What is asserted is the row, because the row is all both backings share. The
+    delivery half has a cost only where there is a delivery *and* a prefetch
+    window small enough to feel it, and this fixture runs at 16 so that one
+    object can play several consumers; it is asserted at `prefetch=1` in
+    `test_discard_returns_the_slot_of_a_consumer_that_reports_nothing`. What the
+    live claim buys here is narrower and still worth having: the release path
+    runs, so a `discard` that raised on a delivery it actually had to settle
+    would fail this test rather than the one test that happens to exercise it.
+    """
+    job = await queue.enqueue(a_request())
+    lease = await reserve(queue)
+
+    await queue.discard(lease)
+    # Twice, because every path that reaches it is one where something has
+    # already gone wrong: a `discard` that could fail on the second call is a
+    # `discard` every caller has to wrap. The first had work to do; this one
+    # finds nothing held.
+    await queue.discard(lease)
+
+    # And the row is exactly as it was. This is the whole of what separates
+    # `discard` from `nack`: no state, no error, no backoff, no attempt spent.
+    # The lease is still the only thing that will ever free this job, which is
+    # what makes the call safe on a job somebody else now owns.
+    row = await queue.get(job.id)
+    assert row.state is JobState.RUNNING
+    assert row.error is None
+    assert row.attempts == 1
+
+
+async def test_discard_leaves_the_lease_usable(queue):
+    # It is not a release. A consumer that discards and then discovers it was
+    # wrong about losing the race can still finish the job, because nothing in
+    # the row moved and fencing is on the token alone.
+    job = await queue.enqueue(a_request())
+    lease = await reserve(queue)
+
+    await queue.discard(lease)
+
+    await queue.ack(lease, result_ref="s3://bucket/key")
+    assert (await queue.get(job.id)).state is JobState.DONE
+
+
 # --------------------------------------------------------------------------
 # Cancellation
 # --------------------------------------------------------------------------

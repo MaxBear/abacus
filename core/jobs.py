@@ -257,6 +257,33 @@ class JobQueue(Protocol):
         """
         ...
 
+    async def discard(self, lease: Lease) -> None:
+        """Let go of a claim without deciding the job's outcome.
+
+        The third way to be done with a lease, and the only one that writes
+        nothing: `ack` says the job succeeded, `nack` says it should go round
+        again, and this says the consumer has no standing to say either. The
+        case it exists for is a lease that was taken while its holder was still
+        working — the row belongs to whoever holds it now, and any write here
+        would either raise `StaleLease` or, worse, land on a job someone else is
+        midway through.
+
+        So the row is deliberately untouched. What this releases is whatever the
+        *implementation* is still holding on the consumer's behalf, which on
+        RabbitMQ is an unacked delivery and at `prefetch=1` is the consumer's
+        only slot. A backing with nothing of the kind implements this as
+        nothing, and that asymmetry is the whole reason it is on the Protocol: a
+        caller cannot know which one it has, and the one that leaks does so
+        silently — a consumer that goes on reserving and is never offered
+        anything reads as a broker fault from every angle except this one.
+
+        Never raises, including on a lease that is already gone, and safe to
+        call twice. Every path that reaches it is a path where something has
+        already failed, and a cleanup that can fail is a cleanup every caller
+        has to wrap.
+        """
+        ...
+
     async def cancel(self, job_id: uuid.UUID) -> Job | None:
         """Ask for a job to stop. Idempotent; returns the job, or `None` if unknown.
 

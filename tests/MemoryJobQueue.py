@@ -54,6 +54,12 @@ class MemoryJobQueue:
         self._rows: dict[uuid.UUID, _Row] = {}
         self._keys: dict[tuple[uuid.UUID | None, str], uuid.UUID] = {}
 
+        # Every lease handed back by `discard`, in order. Recorded rather than
+        # ignored for the same reason `MemoryObjectStore.written` exists: the
+        # call has no observable effect here, and a claim about a caller that
+        # cannot be observed is a claim nothing holds to.
+        self.discarded: list[uuid.UUID] = []
+
     # ----------------------------------------------------------------------
     # Producing
     # ----------------------------------------------------------------------
@@ -237,6 +243,17 @@ class MemoryJobQueue:
         row.job = _replace_state(row.job, state, error=error)
         row.run_after = _now() + (retry_in or timedelta())
         self._release(row)
+
+    async def discard(self, lease: Lease) -> None:
+        # Nothing to settle. This queue's deliveries are rows, and a row is not
+        # held by anybody — there is no per-consumer resource here to leak,
+        # which is exactly the asymmetry the Protocol's docstring warns about.
+        # The half that has one is asserted in `test_rabbitmq_job_queue.py`.
+        #
+        # Not fenced on `lease.id` and not raising on an unknown lease: the
+        # contract is that this never fails, and the only thing a check could
+        # protect is state this method does not touch.
+        self.discarded.append(lease.id)
 
     def _live(self, lease: Lease) -> _Row:
         """The row this lease still holds, or `StaleLease`.

@@ -24,6 +24,7 @@ import os
 import signal
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from worker.solve import Solved, UnknownKind
@@ -57,6 +58,8 @@ def synthetic(payload: dict[str, Any]) -> Solved:
     - `padding_bytes` — how large the artifact is, for the one thing that
       genuinely changes behaviour at size: the result crosses a pipe.
     - `ignore_sigterm` — install `SIG_IGN` and become layer 3's problem.
+    - `ready_file` — touch this path once the solver is genuinely running, so a
+      test can signal a child that is listening rather than one still booting.
     - `raise_error` — fail with this message instead of succeeding.
     - `crash` — leave immediately by `os._exit`, reporting nothing at all.
     """
@@ -66,6 +69,14 @@ def synthetic(payload: dict[str, Any]) -> Solved:
         # supervisor's grace period expiring into a SIGKILL is the only thing
         # that ends this process, which is exactly what layer 3 claims.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    if ready_file := payload.get("ready_file"):
+        # A file, because the pipe cannot carry this: it is one-way and holds
+        # exactly one `Outcome`, so a child has no way to say "I have started"
+        # before it has finished. Touched *after* `ignore_sigterm` is installed,
+        # which is the whole point — a waiter that sees this knows the next
+        # SIGTERM will be discarded, instead of hoping the child got far enough.
+        Path(ready_file).touch()
 
     if payload.get("crash"):
         # `os._exit`, not `sys.exit`: no cleanup, no atexit, and critically no

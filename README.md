@@ -21,12 +21,14 @@ architecture of an LLM agent driving real computation, and the reason this proje
 
 ## Status
 
-**Phase 2 — the job broker.** A `JobQueue` Protocol in `core/`, the `jobs` table behind it, and a
-RabbitMQ implementation on quorum queues: leases, fencing, retry through a delay queue, and the
-periodic repairs a broker-plus-table split needs. No agent and no frontend yet, and `worker/` is
-still empty — phase 3 is what fills it.
+**Phase 3 — containerized workers.** Designed ahead of the code in
+[`docs/worker.md`](docs/worker.md). Landed so far: the object store behind a Protocol, the
+`spawn`ed solve child, and the supervisor that holds one lease against one child — reserve, extend
+on a timer, write the artifact, then `ack`. `docker compose up -d --scale worker=2` runs two of
+them. Still to come: progress events on the fanout, and the acceptance script that kills a worker
+mid-solve. No agent and no frontend yet.
 
-Roadmap: `1` chat over WebSocket → **`2` the job broker on RabbitMQ** → `3` containerized workers →
+Roadmap: `1` chat over WebSocket → `2` the job broker on RabbitMQ → **`3` containerized workers** →
 `4` the analytics engine → `5` chat UI → `6` cloud.
 
 [`docs/roadmap.md`](docs/roadmap.md) gives each phase what it lands, how it is accepted, and the

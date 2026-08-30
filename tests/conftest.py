@@ -1,11 +1,12 @@
 """Fixtures shared across test modules.
 
-Two seams live here, and both are here for the same reason: more than one module
+Three seams live here, and all three for the same reason: more than one module
 wants them. `test_chat_repository.py` runs the persistence contract against
 Postgres and `test_chat_ws.py`'s acceptance test needs the real database behind
 a real socket; `test_job_queue.py` runs the queue contract against RabbitMQ and
 `test_rabbitmq_job_queue.py` asserts what only that implementation can be asked
-about.
+about; `test_object_store.py` asserts what MinIO does with bytes and
+`test_worker_live.py` needs a real bucket for a supervisor to write into.
 
 Everything else stays in the module that uses it. A conftest is a namespace
 every test file silently imports, so what goes in it should be what more than
@@ -17,6 +18,7 @@ from datetime import timedelta
 
 import aio_pika
 import pytest
+from botocore.exceptions import EndpointConnectionError
 from sqlalchemy import delete, func, select
 
 from adapters.postgres.chat_repository import PostgresChatRepository
@@ -24,6 +26,7 @@ from adapters.postgres.db import Database
 from adapters.postgres.job_store import PostgresJobStore
 from adapters.postgres.tables import chat_sessions, jobs
 from adapters.rabbitmq.job_queue import RabbitMQJobQueue
+from adapters.s3.object_store import S3ObjectStore
 from core.config import get_settings
 
 
@@ -174,3 +177,47 @@ async def rabbitmq_queue(created_sessions):
                 )
             await s.commit()
         await db.dispose()
+
+
+@pytest.fixture
+def written_keys() -> list[str]:
+    """Keys a test minted, for the `store` fixture to delete afterwards.
+
+    The same shape as `conftest.py`'s `created_sessions`, and for the same
+    reason: a test and the fixture that cleans up after it both append to one
+    registry, and the fixture reads it during teardown.
+    """
+    return []
+
+
+@pytest.fixture
+async def store(written_keys):
+    """A store on real MinIO, or a skip when nothing answers.
+
+    Here rather than in `test_object_store.py` because two modules now want it:
+    that suite asserts what MinIO does with bytes, and `test_worker_live.py`
+    needs somewhere real for a supervisor to put an artifact. That is this
+    file's own rule for what belongs in it, and the fixture's previous docstring
+    predicted the move.
+    """
+    settings = get_settings()
+    store = await S3ObjectStore.start(settings)
+    # Everything after `start` is inside this, including the skip: the client
+    # holds an aiohttp session, and the reachability probe is not the only thing
+    # that can fail here. `head_bucket` under scoped credentials answers
+    # `AccessDenied`, which is a `ClientError` and would otherwise leave the
+    # session open for the rest of the run.
+    try:
+        try:
+            await store.ensure_bucket()
+        except (EndpointConnectionError, OSError):
+            pytest.skip("no object store reachable — `make up`, and S3_ENDPOINT_URL in .env")
+        yield store
+    finally:
+        # The bucket is shared across runs and nothing lists it, so a test that
+        # does not clean up after itself leaves an object no later run can even
+        # find. Cheaper than a bucket per run, and unlike the RabbitMQ fixture's
+        # topology there is nothing here for a leftover to race with.
+        for key in written_keys:
+            await store.delete(key)
+        await store.close()

@@ -1,16 +1,41 @@
 name: abacus
 
+# The local stack's credentials, and the one block every app service shares.
+#
+# Each credential below appears in two places that have to agree: the service
+# that creates the account, and the URL an app connects with. Written once as an
+# interpolation rather than twice as a literal, because the failure mode of
+# drift is an authentication error at startup that reads like a bug in the
+# application rather than like a typo in this file. `S3_SECRET_KEY` and
+# `MINIO_ROOT_PASSWORD` were the pair most likely to drift, since only one of
+# them is named after the thing it unlocks.
+#
+# `${VAR:-default}` keeps a fresh checkout running with no configuration at all
+# while letting an override exist. Note which `.env` that override lives in:
+# compose reads `./.env` to interpolate *this file*, which is a different
+# mechanism from the `.env` the app reads through pydantic-settings. That one is
+# host-side config — it points at `localhost` — and never enters the image,
+# because `.dockerignore` excludes it.
+#
+# Changing POSTGRES_USER or POSTGRES_PASSWORD after the first `make up` does not
+# re-initialize the database: those are read only when the pgdata volume is
+# created. `make reset` is what makes a new credential take effect.
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-abacus}:${POSTGRES_PASSWORD:-abacus}@postgres:5432/${POSTGRES_DB:-abacus}
+  BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-abacus}:${RABBITMQ_DEFAULT_PASS:-abacus}@rabbitmq:5672/
+  ENV: local
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: abacus
-      POSTGRES_PASSWORD: abacus
-      POSTGRES_DB: abacus
+      POSTGRES_USER: ${POSTGRES_USER:-abacus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-abacus}
+      POSTGRES_DB: ${POSTGRES_DB:-abacus}
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U abacus -d abacus"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-abacus} -d ${POSTGRES_DB:-abacus}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -18,8 +43,8 @@ services:
   rabbitmq:
     image: rabbitmq:4-management-alpine
     environment:
-      RABBITMQ_DEFAULT_USER: abacus
-      RABBITMQ_DEFAULT_PASS: abacus
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-abacus}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-abacus}
     ports:
       - "5672:5672"    # amqp
       - "15672:15672"  # management UI
@@ -36,8 +61,8 @@ services:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: abacus
-      MINIO_ROOT_PASSWORD: abacus-local-secret
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-abacus}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-abacus-local-secret}
     ports:
       - "9000:9000"  # s3 api
       - "9001:9001"  # console
@@ -56,10 +81,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       rabbitmq: {condition: service_healthy}
-    environment:
-      DATABASE_URL: postgresql+asyncpg://abacus:abacus@postgres:5432/abacus
-      BROKER_URL: amqp://abacus:abacus@rabbitmq:5672/
-      ENV: local
+    environment: *app-environment
     ports: ["8000:8000"]
     # Phase 0 has no /jobs yet; once it does, switch this to job-start latency.
     healthcheck:
@@ -69,6 +91,41 @@ services:
       retries: 5
       start_period: 10s
     # Give the graceful-shutdown path room to actually run.
+    stop_grace_period: 30s
+
+  worker:
+    # The same image as the api, started at a different entrypoint. That is
+    # `docs/worker.md`'s point about the build: "the worker runs the same code
+    # the API imports" is a property of there being one Dockerfile, not a
+    # promise someone has to keep in sync.
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    environment:
+      <<: *app-environment
+      # The object store is the worker's alone. The api does not touch it until
+      # phase 5, and a credential given to a service with no use for it is one
+      # more place it can leak from — the same reason the Anthropic key will
+      # belong to the gateway and to nothing else.
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-abacus}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-abacus-local-secret}
+    # `command: []` is not decoration. The Dockerfile's CMD is uvicorn's
+    # arguments, and overriding only the entrypoint would leave compose
+    # appending `--host 0.0.0.0 --port 8000` to `python -m worker`.
+    entrypoint: ["python", "-m", "worker"]
+    command: []
+    # No ports and no healthcheck: a worker has nothing to serve one on, which
+    # `worker.md` leaves open for phase 6 to answer.
+    #
+    # Scale it to prove the acceptance: `docker compose up -d --scale worker=2`,
+    # then kill one mid-solve and watch the job finish on the other.
+    #
+    # Long enough for the supervisor to SIGKILL a child that ignores SIGTERM and
+    # release its lease. Cut this short and the container is killed holding a
+    # job, which then waits out its lease instead of being handed straight back.
     stop_grace_period: 30s
 
 volumes:

@@ -346,6 +346,17 @@ class RabbitMQJobQueue:
             await self._publish(job.id, delay=retry_in)
             await self._store.mark_published(job.id)
 
+    async def discard(self, lease: Lease) -> None:
+        """Hand back the delivery for a claim that is void. No Postgres at all.
+
+        The row is not this consumer's to touch — that is what made the claim
+        void — so the only thing owed to anyone is the prefetch slot. The
+        `lease_id` guard is what makes that safe to say without a round trip: if
+        this process has since re-reserved the same job, the delivery in
+        `_held` belongs to the newer lease and stays put.
+        """
+        await self._release(lease.job.id, lease.id)
+
     # ----------------------------------------------------------------------
     # Publishing, and the periodic repairs the dual write needs
     # ----------------------------------------------------------------------
