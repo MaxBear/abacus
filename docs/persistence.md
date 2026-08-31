@@ -29,11 +29,18 @@ a message still being produced. A message is a fact. So:
 | `delta` | **no** | addressed by `(message_id, chunk_index)`, never replayed, never stored per-chunk |
 | `done` | yes — the assistant message's | the reply is complete and its text is final |
 | `error` | no | not a durable fact about the session |
+| `job_status` | yes — the transition's | phase 3; a `job_events` row, and the reason that table exists |
+| `job_progress` | **no** | phase 5; a percentage is in no row and cannot be reconstructed |
 
 The doc said "only the terminal `done` consumes a session `seq`". That is right about deltas and
 wrong about user messages: `client_msg_id` idempotency requires the user's message to be a row that
 can be looked up, and a row that exists but has no `seq` cannot be replayed on resume. One `seq` per
 row, allocated at insert, keeps a single rule instead of two.
+
+The last two rows arrived in phase 3 and are the rule holding rather than bending — see
+[`job_events`](#job_events-phase-3) below. It is worth noting what the rule *refused* there, because
+it is the same refusal as `delta`: not "should jobs be on the socket" but "may a frame carry a
+number that sometimes means something." The answer stayed no both times.
 
 **What resume replays, therefore, is completed messages — not token streams.** A reconnect during a
 turn gets the assistant row in whatever state it holds, then live deltas continue on the same
@@ -181,6 +188,79 @@ text)` — the select list above, unchanged. `status` is on the wire because a r
 is not always finished: a reply whose socket died mid-turn comes back `failed`, and a client that
 assumed otherwise would render a truncated answer as though the model meant to stop there.
 
+## `job_events` (phase 3)
+
+An amendment, written when phase 3 needed it. Everything above assumed the session log had exactly
+one source, because in 1b it did. `worker.md` broke that assumption by owing the socket a
+`job_status` frame that is a durable fact and therefore, under this document's own rule, a numbered
+row — and a job transition is not a `chat_messages` row. It has no role, no text, no
+`client_msg_id`, and the check constraints tying those together would have to be loosened to admit
+it. Loosening a constraint so a foreign thing can pretend to be a message is how a schema starts
+lying about what it holds.
+
+```sql
+create table job_events (
+  id         bigint generated always as identity primary key,
+  job_id     uuid   not null references jobs(id)          on delete cascade,
+  session_id uuid   not null references chat_sessions(id) on delete cascade,
+  seq        bigint not null,                 -- from chat_sessions.next_seq, as everything else
+  state      text   not null,
+  created_at timestamptz not null default now(),
+
+  unique (session_id, seq),
+  check (state in ('queued','running','done','failed','dead','cancelled'))
+);
+```
+
+**One row per transition, not one per job.** The tempting economy is to give a job a single `seq` at
+enqueue and let every transition reuse it, and it fails twice over. `seq` is a position in a log
+rather than a name for a thing, so three transitions sharing a number cannot be ordered against the
+messages that arrived between them — and a client resuming from past that number is never told the
+job finished, because `where seq > $2` excludes it. Neither is a rendering nuisance; the second is a
+spinner that never stops. Nor can the transitions borrow the seq of the assistant message that
+caused the job: same arithmetic, and jobs need not have a message at all.
+
+**`session_id` is denormalised** — reachable through `job_id`, carried anyway so resume is a range
+scan on `(session_id, seq)` with no join, which is the same argument the `chat_messages` unique
+constraint already makes. It is `not null` here although `jobs.session_id` is nullable: a job with no
+session has nobody to tell, and writes no events.
+
+**Written in the same transaction as the state change**, inside `PostgresJobStore`, where all six
+transitions already live — `insert_or_get`, `cancel`, `claim`, `retire_lapsed`, `ack`, `nack`. That
+placement is not tidiness. `retire_lapsed` runs in a maintenance loop with no worker watching and no
+session context in scope, so any publisher bolted on further out would silently miss the transitions
+of jobs whose consumer died — precisely the ones a waiting client most needs to hear about. Being
+one transaction also means the row and the state can never disagree, which is what lets the
+`chat.events` fanout be lossy without anything being lost.
+
+The cost, stated rather than absorbed: **the worker now allocates in the chat sequence space.**
+`PostgresJobStore` reaches `chat_sessions` for `next_seq`, taking the same row lock live turns take,
+so the queue touches the schema `core/jobs.py:86` deliberately kept it independent of. Three or four
+rows per five-minute job makes the contention theoretical; the coupling is real, and it is what a
+replayable transition costs.
+
+### Resume, merged
+
+```sql
+-- unchanged
+select seq, message_id, role, status, text
+  from chat_messages where session_id = $1 and seq > $2 order by seq limit $3;
+
+-- and
+select seq, job_id, state
+  from job_events    where session_id = $1 and seq > $2 order by seq limit $3;
+```
+
+Two bounded range scans merged on `seq`, rather than one query returning a union of two row shapes
+padded with nulls. The bound applies to the merged result, so each side asks for `limit + 1` and the
+merge truncates — the `resume_too_old` test above is then unchanged, since it still asks whether
+more rows exist after `last_seq` than the bound will replay.
+
+Merging in the application rather than in SQL is a deliberate choice and a cheap one: both inputs
+are sorted, both are bounded by the same constant, and the alternative buys a wider select list and
+a `union all` whose column list has to be maintained in two places every time either row shape
+grows.
+
 ## Work, in dependency order
 
 1. **Alembic bootstrap.** No `alembic/` exists yet. Config, env, one initial revision. Decide
@@ -216,12 +296,17 @@ say. Use `asyncio.wait_for`.
 
 ## Open
 
-- **Retention.** Nothing above deletes anything, so `chat_messages` grows without bound. That no
-  longer makes `resume_too_old` unreachable — the depth bound fires on its own — but it does leave
-  the second trigger for that error unimplemented, and it is the input to whether this table needs
-  partitioning by time later.
+- **Retention.** Nothing above deletes anything, so `chat_messages` grows without bound — and since
+  phase 3, `job_events` alongside it. That no longer makes `resume_too_old` unreachable — the depth
+  bound fires on its own — but it does leave the second trigger for that error unimplemented, and it
+  is the input to whether these tables need partitioning by time later. Note that any retention
+  policy has to cut both at the same `seq`, or a resume returns half a log.
 - **Multi-tab writes.** Two sockets on one session now contend for the same `next_seq` row. Ordering
   stays correct; whether a second tab *should* be able to submit mid-turn is still the product
   question `websocket.md` flags, not a transport one.
+- **The worker contends for `next_seq` too**, since phase 3. Same row lock, now taken from a second
+  service on a schedule nobody coordinates. Correctness is unaffected — that is what the lock is for
+  — but it is the first time the chat allocator has a writer outside the API, and it is the thing to
+  look at first if session throughput ever becomes a question.
 - **`Error` frames carry no `client_msg_id`**, so a client cannot tell which message was rejected.
   Adding it is an additive `v1` change and belongs here, with the rest of the idempotency work.

@@ -523,6 +523,15 @@ lands carrying state transitions only, driven by the synthetic consumer. Phase 3
 and routes it through the fanout exchange. Frame shape does not change between the two — the same
 discipline the stub responder exists to enforce.
 
+> **Amended in phase 3, and the prediction in that last sentence is the part that did not hold.**
+> The frame shape *did* change: `progress` moved out to a `job_progress` frame of its own, leaving
+> `job_status` as `seq`, `job_id`, `state`. The reasoning is in `worker.md` and the rule it turns on
+> is this document's own — a percentage is not a durable fact, so numbering it would either cost an
+> insert per tick or tear a hole in a gap-free sequence space. Also amended: this frame's `seq` comes
+> from a `job_events` row rather than from anything in `jobs`, because a job has many transitions and
+> one row cannot hold a number for each. Neither correction touches what phase 2 built; both are
+> what "narrowing" turned out to mean once there was a worker to be honest about.
+
 **`cancel`** is the harder half, because "stop it" means two unrelated things depending on whether a
 consumer has the job yet.
 
@@ -568,8 +577,10 @@ One concern per PR, as in phase 0 and 1b.
    a failed teardown, a republish damper that was inert at its own default interval, and a test
    constant named after nothing.
 6. ~~**The benchmark harness and `docs/benchmark.md`.**~~ — **out of scope**, see above.
-7. **`job_status` and narrowed `cancel`** on the wire, additive under `v1`. Still open; it is the
-   one piece of phase 2 that phase 3 needs and phase 5 consumes.
+7. **`job_status` and narrowed `cancel`** on the wire, additive under `v1`. **Handed to phase 3**,
+   which is step 4 of `worker.md`'s work order — not deferred for time, but because both frames
+   describe a worker and phase 2 has none to describe. `websocket.md`'s phasing table records the
+   move rather than quietly relabelling it.
 
 Step 5 was the phase. Step 2 is what made it checkable, and it came first because a contract nobody
 has implemented twice is a guess.

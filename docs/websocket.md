@@ -102,7 +102,37 @@ that silently does nothing is indistinguishable, from the client's side, from on
 | `message` | `seq`, `message_id`, `role`, `status`, `text` | 1b | one stored message, replayed whole; only `resume` sends it |
 | `error` | `code`, `message`, `retryable` | 1a | application error; the socket stays open |
 | `pong` | — | 1a | |
-| `job_status` | `seq`, `job_id`, `state`, `progress` | 2 | `queued`/`running`/`done`/`failed` |
+| `job_status` | `seq`, `job_id`, `state` | 3 | a transition: `queued`/`running`/`done`/`failed`/`dead`/`cancelled` |
+| `job_progress` | `job_id`, `progress` | 5 | unnumbered and lossy; never replayed |
+
+`job_status` and `job_progress` were one frame in this table until phase 3, carrying `progress` as a
+fourth field alongside `seq`. They are two because **a percentage is not a durable fact** — it is in
+no row, it cannot be reconstructed after a reconnect, and numbering it would mean either an insert
+per tick to mint a number obsolete on arrival, or a hole in a sequence space whose gap-freeness
+`persistence.md` treats as an invariant. `worker.md` argues it at length. The split is the same one
+`delta` already makes below, applied to a second producer: the durable thing gets a number, the
+rendering detail does not.
+
+**`job_progress` is specified here and built in phase 5**, which is the split earning its keep
+rather than a schedule slipping. Everything needed to carry a percentage is machinery phase 3 would
+otherwise have to invent for a number nothing can yet render: the child's contract is exactly one
+message (`worker/child.py:11`), `SolveProcess` reads the pipe once, and `Solver` is
+`payload → Solved` with nowhere to report from. Worse, the only solver that exists is `synthetic`,
+whose progress is exact *because its duration was an input* — designing the protocol against it
+would prove nothing, which is the trap `worker.md` names about cooperative mocks. Phase 5 is the
+first thing with a bar to fill and phase 4 the first with real work to count. Deferring is safe
+precisely because the frames are separate: adding one later is additive under `v1` and touches
+nothing, where a fourth field on `job_status` could not have been added without a version bump.
+
+Note what a client can do without it. `job_status(running)` carries a `seq` and arrives at a known
+moment, so elapsed time is computable client-side with no server support at all — which is most of
+what a progress indicator is for, and honest in a way a synthesised percentage is not.
+
+A transition earns its `seq` the ordinary way — it is a row, in `job_events`, allocated from the
+session's counter at insert, and replayed by the same cursor that replays messages. It is *not* the
+`seq` of the message that caused the job: one message spawns many transitions, and a shared number
+can neither be ordered against the messages between them nor survive a client whose cursor has
+already passed it. `persistence.md` carries the table and the merged resume scan.
 
 `delta` carries `(message_id, chunk_index)` rather than a session `seq`, which is what lets several
 turns stream concurrently on one socket without ambiguity. That question — whether deltas need their
@@ -177,6 +207,13 @@ sends it to a full reload instead. The server therefore asks for one row more th
 Under more than one API replica — which is the deployed configuration from phase 6 — the pod holding
 a session's socket is almost never the pod that learns the job finished. The worker publishes
 completion to RabbitMQ; some arbitrary replica consumes it.
+
+Note which half of that is load-bearing. A transition is already a committed row by the time
+anything is published — `job_events`, written in the same transaction as the state change — so the
+bus is delivering news the database has already recorded. Losing a message costs latency and
+nothing else. Progress is the opposite and has no durable half at all, which is exactly why it is a
+separate frame carrying no `seq`: there is nothing for a resume to fall back on, and nothing that
+needs one.
 
 **Every API replica binds an exclusive, auto-delete queue to a fanout exchange** (`chat.events`) at
 startup, and forwards each event to whichever connections for that session it happens to hold
@@ -316,9 +353,10 @@ Two traps, both hit while writing 1a:
 | --- | --- |
 | **1a** | Endpoint, envelope types, connection lifecycle, origin check, backpressure, per-session and per-turn caps, in-memory registry, stub streaming responder. Messages do not survive the connection. |
 | **1b** | Postgres persistence: `chat_sessions` / `chat_messages`, alembic bootstrap, `seq` allocation, `resume`, `client_msg_id` idempotency. |
-| **2** | `job_status` frames sourced from the broker; `cancel`. |
-| **3** | Worker progress events; the RabbitMQ fanout exchange and per-replica queues. |
+| **2** | ~~`job_status` frames sourced from the broker; `cancel`.~~ Neither landed. Phase 2 built the queue beneath them and stopped there, on the grounds `jobs.md` records: both frames need a worker to be about, and there was none until phase 3. Moved down a row rather than quietly dropped. |
+| **3** | `job_events` and the merged resume scan; `job_status` on the wire; the `chat.events` fanout exchange and per-replica queues. `cancel` rides along, since a frame that stops a solve is only honest once something can be stopped. |
 | **4** | The stub responder is replaced by the LLM gateway. Frame shapes do not change — that is the point of designing them against a stub. |
+| **5** | `job_progress`, and the worker-to-child channel that carries it. Here rather than in phase 3 because the analyses that can count their own work are phase 4's, and the bar that renders the count is this phase's. |
 | **6** | Ingress timeouts aligned with the heartbeat interval; the `preStop` drain hook, since lifespan shutdown runs too late to be one. |
 
 ## Open questions
@@ -326,7 +364,14 @@ Two traps, both hit while writing 1a:
 - **Ticket versus cookie** is unresolved and depends on where the phase-5 UI is served from. Ticket
   is the safer default for a separately-hosted frontend.
 - **Multi-tab semantics.** Two sockets on one session do *not* both receive every frame: a turn
-  writes to the connection that started it, and `ConnectionRegistry.for_session` has no caller
-  outside tests until the phase-3 fan-out lands. A second tab sees another tab's turn only by
+  writes to the connection that started it, and a second tab sees another tab's turn only by
   reconnecting or resuming. Whether it should be able to submit while a turn is in flight is a
   product question, not a transport one.
+
+  Phase 3 makes this **inconsistent rather than merely incomplete**, and deliberately so. The
+  fan-out's first caller of `ConnectionRegistry.for_session` delivers `job_status` to *every*
+  connection the replica holds for a session, because the worker publishing it has no connection to
+  prefer — while `delta` and `done` still go only to the socket that started the turn. So after phase 3 one class of frame is per-session and another is
+  per-connection. That is the honest consequence of who produces each, not a decision about tabs;
+  making them agree means answering the product question above, which phase 5 is the first thing
+  entitled to answer.

@@ -157,8 +157,9 @@ rather than pretended about now.
 
 ## Progress on the wire
 
-`websocket.md` assigns phase 3 the worker's progress events, the `chat.events` fanout exchange, and
-the per-replica queues. The mechanism is settled there: every API replica binds an exclusive,
+`websocket.md` assigned phase 3 the worker's progress events, the `chat.events` fanout exchange, and
+the per-replica queues — the first of those has since moved to phase 5, for reasons this section
+arrives at. The mechanism is settled there: every API replica binds an exclusive,
 auto-delete queue at startup, forwards each event to whichever connections for that session it holds
 locally, and discards the rest. Lossy on purpose — durability is Postgres', and resume covers gaps.
 
@@ -170,12 +171,36 @@ numbering it means either persisting every progress tick — an insert per tick 
 number obsolete on arrival — or leaving a hole in a sequence space whose gap-freeness
 `persistence.md` treats as an invariant.
 
-The resolution this document proposes, and marks open below: **state transitions and progress are
-two different frames, not two fields of one.** A transition is durable, numbered, and reconstructible
-from the row on resume; progress is unnumbered, lossy, and never replayed. A client that reconnects
-mid-solve learns the state from the row and simply waits for the next progress tick. Merging them
-into one frame with a sometimes-meaningful `seq` would put the exception inside the invariant, which
-is the thing `persistence.md` exists to prevent.
+**Settled: state transitions and progress are two different frames, not two fields of one.** A
+transition is durable, numbered, and replayed on resume; progress is unnumbered, lossy, and never
+replayed. A client that reconnects mid-solve is told every transition it missed and then simply
+waits for the next progress tick. Merging them into one frame with a sometimes-meaningful `seq`
+would put the exception inside the invariant, which is the thing `persistence.md` exists to prevent.
+`websocket.md`'s frame table carries the two shapes.
+
+That settles which frames exist. It leaves a second question the phasing tables never asked, because
+until now nothing needed a `seq` that was not a chat message: **where a transition's number comes
+from.** `persistence.md`'s rule is that a `seq` belongs to a row, and a job transition is not a row
+in `chat_messages` — it has no role, no text, and no `client_msg_id`, and inventing values for those
+to make it fit would be a schema lying about what it holds. Nor can the transitions of one job share
+a number: `seq` is a position in a log rather than a name for a thing, so three transitions on one
+`seq` cannot be ordered against the messages between them, and a client resuming from past that
+number is never told the job finished at all.
+
+So a transition is its own row, in its own table, drawing from the same per-session allocator.
+`persistence.md` carries `job_events` and the merged resume scan; what belongs here is the
+consequence for this phase, which is that **the worker writes rows in the chat sequence space.**
+That is a real cost and worth naming rather than absorbing: `PostgresJobStore` reaches `chat_sessions`
+to allocate, so the queue now touches the schema `core/jobs.py:86` deliberately kept it independent
+of, and every transition briefly contends with that session's live turns for one row lock. The
+volume is three or four rows per five-minute job, so the contention is theoretical; the coupling is
+not, and it is the price of transitions being replayable.
+
+What it buys is that the fanout becomes an optimisation rather than a mechanism. The transition and
+its event row commit together, so a `chat.events` message that is never published — or is published
+to a replica holding no socket, which is most of them — costs nothing at all. Resume finds the row.
+That is the same argument the bus was already allowed to be lossy on, now with something durable
+actually standing behind it.
 
 ## The stack
 
@@ -200,11 +225,24 @@ One concern per PR, as in every phase before this.
    before the supervisor.
 3. **The supervisor**: reserve → spawn → extend loop → write → `ack`/`nack`, with the three `extend`
    outcomes and the wall-clock cap. This is the phase.
-4. **The fanout**: `chat.events`, per-replica queues, and `job_status` on the wire.
+4. **The fanout**: `chat.events`, per-replica queues, and `job_status` on the wire. Two concerns and
+   therefore two PRs — the durable half (`job_events`, the event row written inside each of
+   `PostgresJobStore`'s six state transitions, and the merged resume scan) stands on its own and is
+   testable against Postgres with no broker; the bus (`core/events.py`, `adapters/rabbitmq/events.py`,
+   the per-replica queue bound at API startup) follows. `cancel` lands with the second, since the
+   frame is only honest once there is something to stop.
 5. **The acceptance check**: a script that kills a worker mid-solve and asserts the job completes
    elsewhere, in the shape of `verify-phase0.sh`.
 
-Steps 1 and 2 are independent and could land in either order; 3 needs both.
+Steps 1 and 2 are independent and could land in either order; 3 needs both. Step 4's own two are
+ordered, because the bus carries what the rows already record.
+
+**Worker progress is not in this phase.** `websocket.md` specifies `job_progress` and assigns it to
+phase 5, where there is a bar to render it and — from phase 4 — an analysis that can count its own
+work. What phase 3 would have had to build for it is the whole of the child's second channel: the
+one-message contract at `worker/child.py:11`, `SolveProcess`'s single `recv`, and a `Solver`
+signature with somewhere to report. All of that against `synthetic`, whose progress is exact only
+because its duration was an input. The frames being separate is what makes the deferral free.
 
 ## Testing
 
@@ -241,11 +279,18 @@ redelivered" hangs rather than fails when redelivery never happens.
   write plus the fencing argument again.
 - **The solve gets a wall-clock cap** independent of the lease, because the lease can only report on
   the worker, never on the work.
+- **Progress and state are two frames**, and a transition is a row in `job_events` drawing a `seq`
+  from the session allocator. The worker therefore writes in the chat sequence space, which couples
+  it to `chat_sessions`; the return is that a lost fanout message costs nothing, because resume
+  replays the row. Only `job_status` is built here — `job_progress` is specified and deferred to
+  phase 5, which the split is what makes possible.
+- **The event row is written where the state changes**, inside `PostgresJobStore`, in the same
+  transaction. All six transitions already live there, `retire_lapsed` included — which is the one
+  no worker is watching and no session context reaches, and therefore the one a publisher bolted on
+  anywhere else would silently drop.
 
 ## Open
 
-- **Do progress and state share a frame?** Proposed above as no. It is `websocket.md`'s call, and it
-  changes the phasing table there.
 - **Reaping orphaned artifacts.** Every lost race leaves an object nothing points at. A bucket
   lifecycle rule keyed on age is the cheap answer; a sweep that joins against `result_ref` is the
   exact one. Neither is needed for correctness, and the cheap one probably wins.
