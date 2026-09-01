@@ -227,10 +227,24 @@ One concern per PR, as in every phase before this.
    outcomes and the wall-clock cap. This is the phase.
 4. **The fanout**: `chat.events`, per-replica queues, and `job_status` on the wire. Two concerns and
    therefore two PRs — the durable half (`job_events`, the event row written inside each of
-   `PostgresJobStore`'s six state transitions, and the merged resume scan) stands on its own and is
-   testable against Postgres with no broker; the bus (`core/events.py`, `adapters/rabbitmq/events.py`,
-   the per-replica queue bound at API startup) follows. `cancel` lands with the second, since the
-   frame is only honest once there is something to stop.
+   `PostgresJobStore`'s six state transitions, and the merged resume scan behind
+   `ChatRepository.log_since`) stands on its own and is testable against Postgres with no broker; the
+   bus (`core/events.py`, `adapters/rabbitmq/events.py`, the per-replica queue bound at API startup)
+   follows. `cancel` lands with the second, since the frame is only honest once there is something to
+   stop.
+
+   **The `job_status` frame lands with the first PR**, which is easy to read the wrong way round.
+   `log_since` returns transitions, so resume has something to emit the day the rows exist — and
+   landing the method with no caller is exactly the unused-Protocol-method problem that demoted
+   `messages_since`. The frame therefore arrives doing something real, replaying what a reconnecting
+   client missed, which is the rule `core/frames.py:11` states. The bus adds *live* delivery of the
+   same frame and changes nothing about its shape.
+
+   **`JobEvent` goes in `core/jobs.py`**, beside the `JobState` it carries, and
+   `core/chat_repository.py` imports it for `log_since`'s return type. That module imports only
+   stdlib today, so this is the first dependency it grows. The alternative — redeclaring the state as
+   a bare `str` to keep the leaf a leaf — buys tidiness by discarding the enum, which is the worse
+   trade for one import that stays inside `core/`.
 5. **The acceptance check**: a script that kills a worker mid-solve and asserts the job completes
    elsewhere, in the shape of `verify-phase0.sh`.
 
