@@ -21,6 +21,7 @@ from core.chat_handler import ConnectionHandler
 from core.chat_repository import Role, Status
 from core.config import Settings
 from core.frames import PROTOCOL_VERSION, Error, ErrorCode, Pong
+from core.jobs import JobState
 from core.responder import StubResponder
 from core.ws import (
     WS_NORMAL,
@@ -198,7 +199,7 @@ def test_a_turn_that_raises_leaves_the_row_failed_not_streaming(client, reposito
         assert err["code"] == ErrorCode.INTERNAL
         assert err["retryable"] is True
 
-    rows = asyncio.run(repository.messages_since(uuid.UUID(SESSION), 0, 10))
+    rows = asyncio.run(repository.log_since(uuid.UUID(SESSION), 0, 10))
     assert [(r.role, r.status) for r in rows] == [
         (Role.USER, Status.COMPLETE),
         (Role.ASSISTANT, Status.FAILED),
@@ -259,6 +260,58 @@ def test_resume_replays_stored_messages_in_seq_order(client):
     assert assistant["status"] == Status.COMPLETE
     # The whole reply in one frame, not the four the stub streamed as deltas.
     assert assistant["text"] == "echo: hello "
+
+
+def test_resume_replays_job_transitions_between_the_messages_they_happened_between(
+    client, repository
+):
+    """The fan-out's safety net, and the reason it is allowed to be lossy.
+
+    A `job_status` sent live to a socket that was not connected is simply gone.
+    What makes that acceptable is this: the transition is a numbered row in the
+    same log as the messages, so a reconnecting client is told about it by the
+    same cursor that replays everything else — in the position it actually
+    happened in, not at the end.
+    """
+    job_id = uuid.uuid4()
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "run the backtest", "c1")  # seq 1 and 2
+        repository.record_job_event(uuid.UUID(SESSION), job_id, JobState.QUEUED)
+        repository.record_job_event(uuid.UUID(SESSION), job_id, JobState.RUNNING)
+
+        replayed = _resume(ws, 0)
+
+    assert [f["type"] for f in replayed] == ["message", "message", "job_status", "job_status"]
+    assert [f["seq"] for f in replayed] == [1, 2, 3, 4]
+
+    transitions = replayed[2:]
+    # The job's own identity, not the message's: one message spawns several
+    # transitions, and the client watches the job.
+    assert {f["job_id"] for f in transitions} == {job_id.hex}
+    assert [f["state"] for f in transitions] == [JobState.QUEUED, JobState.RUNNING]
+    # No progress key on either — not a null one. A percentage is not a durable
+    # fact and does not ship here; `job_progress` is phase 5, unnumbered, and
+    # never replayed. A key appearing here would mean the split had collapsed.
+    assert all("progress" not in f for f in transitions)
+
+
+def test_a_transition_counts_against_the_resume_bound_like_any_other_entry(client, repository):
+    """The bound is on the log, not on the messages in it.
+
+    Counting only messages would let a solve's transitions push a replay past a
+    limit that exists to stop one — and the client would be handed a gap it
+    cannot see, which is the exact thing `resume_too_old` refuses to do.
+    """
+    app.dependency_overrides[deps.get_settings] = lambda: Settings(ws_resume_max_messages=2)
+
+    with client.websocket_connect(URL) as ws:
+        _say_and_settle(ws, "hello", "c1")  # two messages: at the bound
+        repository.record_job_event(uuid.UUID(SESSION), uuid.uuid4(), JobState.QUEUED)
+
+        (err,) = _resume(ws, 0)
+
+    assert err["type"] == "error"
+    assert err["code"] == ErrorCode.RESUME_TOO_OLD
 
 
 def test_resume_is_exclusive_of_the_clients_cursor(client):
@@ -741,7 +794,7 @@ def test_the_registry_forgets_sessions_it_no_longer_holds():
 
 
 @pytest.fixture
-def pg_client(postgres_repo):
+def pg_client(postgres_chat_repo):
     """A client with no repository override, so the app's own wiring is used.
 
     The acceptance test is the one place a mock proves nothing: what it checks
@@ -749,7 +802,7 @@ def pg_client(postgres_repo):
     with itself. `lifespan` already builds a real `PostgresChatRepository`, so
     the way to get one here is to override nothing.
 
-    `postgres_repo` is requested for the two things it does *not* hand over —
+    `postgres_chat_repo` is requested for the two things it does *not* hand over —
     the skip when no database answers, and the row cleanup afterwards. Its pool
     belongs to the fixture's event loop while TestClient runs the app on its
     own, and an asyncpg connection cannot cross loops: passing that repository

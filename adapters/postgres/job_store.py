@@ -15,6 +15,12 @@ One transaction per method, opened and closed inside it, as in
 `chat_repository.py`. Nothing here holds a lock across anything a caller does —
 a lease is a timestamp in a row, never a held lock, which is the whole reason a
 five-minute solve can outlive the process that claimed it.
+
+Since phase 3 every state change also writes a `job_events` row, in the same
+transaction. That is what makes a transition replayable on resume, and it is
+why this module now reaches `chat_sessions` for a `seq` — the coupling
+`core/jobs.py:86` kept the queue free of, paid for deliberately and priced in
+`docs/persistence.md`. `_record_event` carries the argument.
 """
 
 import uuid
@@ -32,9 +38,11 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from adapters.postgres.db import Database
-from adapters.postgres.tables import jobs
+from adapters.postgres.seq import allocate_seq
+from adapters.postgres.tables import job_events, jobs
 from core.jobs import Job, JobRequest, JobState, Lease, StaleLease
 
 # The columns a `Job` is built from, in one place so that a select list and an
@@ -154,6 +162,10 @@ class PostgresJobStore:
         async with self._db.session() as s:
             row = (await s.execute(stmt)).first()
             if row is not None:
+                # Only on a real insert. A duplicate `enqueue` returns the
+                # existing job and is not a transition, so numbering it would
+                # tell a client the same job was queued twice.
+                await self._record_event(s, row)
                 await s.commit()
                 return _to_job(row), True
 
@@ -221,6 +233,12 @@ class PostgresJobStore:
         )
         async with self._db.session() as s:
             row = (await s.execute(stmt)).first()
+            # A running job keeps its state — this raised the flag and nothing
+            # else — so there is no transition to record and no frame to send.
+            # The client hears about it when the consumer sees the flag on its
+            # next `extend` and `nack`s, which is the one event that is true.
+            if row is not None and JobState(row.state) is not JobState.RUNNING:
+                await self._record_event(s, row)
             await s.commit()
             if row is not None:
                 return _to_job(row)
@@ -266,6 +284,8 @@ class PostgresJobStore:
         )
         async with self._db.session() as s:
             row = (await s.execute(stmt)).first()
+            if row is not None:
+                await self._record_event(s, row)
             await s.commit()
             if row is None:
                 return None
@@ -330,10 +350,18 @@ class PostgresJobStore:
                 lease_owner=null(),
                 updated_at=func.now(),
             )
-            .returning(jobs.c.id)
+            .returning(jobs.c.id, jobs.c.session_id, jobs.c.state)
         )
         async with self._db.session() as s:
             rows = (await s.execute(stmt)).all()
+            # The transitions no worker is watching, and therefore the ones a
+            # waiting client most needs — which is why the event is written
+            # here rather than by a publisher further out that has no session
+            # in scope. Sorted by session so two replicas sweeping at once take
+            # the allocator's row locks in the same order; this is the only
+            # method that can hold more than one at a time.
+            for row in sorted(rows, key=lambda r: (r.session_id is None, r.session_id)):
+                await self._record_event(s, row)
             await s.commit()
             return [row.id for row in rows]
 
@@ -390,13 +418,14 @@ class PostgresJobStore:
                 result_ref=result_ref,
                 **_RELEASED,
             )
-            .returning(jobs.c.id)
+            .returning(jobs.c.id, jobs.c.session_id, jobs.c.state)
         )
         async with self._db.session() as s:
             row = (await s.execute(stmt)).first()
-            await s.commit()
             if row is None:
                 raise StaleLease(f"lease {lease.id} is no longer live for job {lease.job.id}")
+            await self._record_event(s, row)
+            await s.commit()
 
     async def nack(self, lease: Lease, *, error: str, retry_in: timedelta | None = None) -> Job:
         """Give the job back. Returns what it became, which decides republishing.
@@ -435,10 +464,46 @@ class PostgresJobStore:
         )
         async with self._db.session() as s:
             row = (await s.execute(stmt)).first()
-            await s.commit()
             if row is None:
                 raise StaleLease(f"lease {lease.id} is no longer live for job {lease.job.id}")
+            await self._record_event(s, row)
+            await s.commit()
             return _to_job(row)
+
+    # ----------------------------------------------------------------------
+    # The session log
+    # ----------------------------------------------------------------------
+
+    async def _record_event(self, s: AsyncSession, row) -> None:
+        """Number this transition in the session's log, in the caller's transaction.
+
+        Takes the row the statement just returned rather than what the caller
+        believed: `state` is whatever was actually written, so an event cannot
+        disagree with the row it reports. That is also what lets the
+        `chat.events` fan-out be lossy — the two commit together, so a message
+        that never reaches a replica costs nothing and resume finds the row.
+
+        **A job with no session writes nothing.** `jobs.session_id` is nullable
+        because a scheduled backfill has no conversation, and a transition with
+        nobody to tell is not a fact about a chat log. `job_events.session_id`
+        is `not null` for the same reason.
+
+        The lock order is `jobs` first, then `chat_sessions`, and nothing in the
+        system takes those two the other way round — `chat_repository.py` locks
+        the session and touches `chat_messages`, never `jobs`. Worth stating,
+        because a future writer that did would close the cycle.
+        """
+        if row.session_id is None:
+            return
+        seq = await allocate_seq(s, row.session_id)
+        await s.execute(
+            job_events.insert().values(
+                job_id=row.id,
+                session_id=row.session_id,
+                seq=seq,
+                state=JobState(row.state),
+            )
+        )
 
 
 def _fencing(lease: Lease):

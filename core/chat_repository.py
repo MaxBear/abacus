@@ -16,6 +16,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+# The one import this leaf grows, and it stays inside `core/`. `log_since`
+# returns both row shapes, so the alternative is redeclaring a transition's
+# state as a bare `str` here — tidiness bought by discarding the enum, which is
+# the worse trade. See `docs/worker.md`.
+from core.jobs import JobEvent
+
 
 class Role(StrEnum):
     """Who produced a message.
@@ -72,7 +78,11 @@ class RecordedUserMessage:
 
 
 class ChatRepository(Protocol):
-    """Durable storage for one chat session's messages.
+    """Durable storage for one chat session's log.
+
+    Messages, and since phase 3 the job transitions numbered alongside them.
+    "The session log" is the concept both tables are part of, which is why
+    asking for it is one method rather than a second Protocol.
 
     Implementations own their own transactions. A caller never sees a session,
     never commits, and cannot hold a lock open across an await it does not
@@ -133,17 +143,24 @@ class ChatRepository(Protocol):
         """
         ...
 
-    async def messages_since(
+    async def log_since(
         self, session_id: uuid.UUID, after_seq: int, limit: int
-    ) -> list[StoredMessage]:
-        """History after `after_seq`, in `seq` order, at most `limit`.
+    ) -> list[StoredMessage | JobEvent]:
+        """The session log after `after_seq`, in `seq` order, at most `limit`.
+
+        The log has two sources since phase 3 — messages, and the job
+        transitions in `job_events` — and one method rather than two is the
+        point: both draw from the same per-session allocator, so "what did I
+        miss" is one question with one answer, and the handler never learns
+        there are two tables. `docs/persistence.md` records the alternatives.
 
         Every row, in whatever state it holds — not just completed ones. A reply
         whose socket died mid-turn is `failed`, and resume has to hand that back
         rather than hide it: a client told nothing would wait forever for a turn
         that is never coming.
 
-        The bound is not politeness: unbounded replay turns a week-old tab into
-        a full history dump on a single reconnect.
+        The bound applies to the merged result and is not politeness: unbounded
+        replay turns a week-old tab into a full history dump on a single
+        reconnect.
         """
         ...
