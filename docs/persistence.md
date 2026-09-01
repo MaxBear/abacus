@@ -19,7 +19,7 @@ The acceptance test for the whole phase is one sentence from
 **Adopt that answer, with one correction: `seq` is a property of a row in `chat_messages`, and user
 messages get one too.**
 
-The rule that makes it coherent is already in `websocket.md:125`: a `seq` is allocated *when the
+The rule that makes it coherent is already in `websocket.md:195`: a `seq` is allocated *when the
 frame's underlying fact is written to Postgres*. A delta is not a fact — it is a rendering detail of
 a message still being produced. A message is a fact. So:
 
@@ -142,7 +142,7 @@ returning seq, message_id;
 
 No row returned means the key was already recorded, so the handler re-reads the existing row and
 re-`ack`s it with the original `seq` and `message_id` rather than starting a second turn
-(`websocket.md:147-152`). `do nothing` in preference to a no-op `do update`: the update form always
+(`websocket.md:174-179`). `do nothing` in preference to a no-op `do update`: the update form always
 returns the row but writes a dead tuple on every duplicate, and duplicates here are the rare path.
 
 This is the one place a check-then-insert would be a real bug rather than a style problem — two
@@ -233,6 +233,20 @@ of jobs whose consumer died — precisely the ones a waiting client most needs t
 one transaction also means the row and the state can never disagree, which is what lets the
 `chat.events` fanout be lossy without anything being lost.
 
+**`job_events` sits *below* the `JobQueue` contract, and `MemoryJobQueue` does not write it.** The
+35-test suite in `tests/test_job_queue.py` runs over both implementations and passes unmodified,
+because it never asks about events. That is a knowing divergence — the first place the two
+implementations differ on purpose — and it is the right one: this table is about the *chat sequence
+space*, and the memory double has no `chat_sessions`, no `next_seq`, and no notion of a session log
+to put a row in. Making it write events would mean inventing a per-session monotonic allocator that
+behaves like a row lock under concurrency, inside a dict — testing the imitation rather than the
+thing — and it would force a read method onto the `JobQueue` Protocol whose only caller is the test
+suite, duplicating the `log_since` that `ChatRepository` now owns.
+
+The precedent is the suite's own (`tests/test_job_queue.py:9-15`): what the memory run cannot
+demonstrate is asserted against the real implementation instead. See [Testing](#testing) for what
+that obliges here, which is not optional.
+
 The cost, stated rather than absorbed: **the worker now allocates in the chat sequence space.**
 `PostgresJobStore` reaches `chat_sessions` for `next_seq`, taking the same row lock live turns take,
 so the queue touches the schema `core/jobs.py:86` deliberately kept it independent of. Three or four
@@ -261,6 +275,48 @@ are sorted, both are bounded by the same constant, and the alternative buys a wi
 a `union all` whose column list has to be maintained in two places every time either row shape
 grows.
 
+The merge is total and needs no tie-break: both tables draw their `seq` from the same
+`chat_sessions.next_seq`, so the two streams interleave into one order with no collisions. That is
+the property Fork A was chosen for, and it is what makes this three lines rather than a policy.
+
+### Where the merge lives
+
+**`ChatRepository` grows one method, `log_since`, and the handler never learns there are two
+tables.** The two queries and the merge sit inside `PostgresChatRepository`, next to each other and
+next to the index definitions they depend on.
+
+```python
+async def log_since(
+    self, session_id: uuid.UUID, after_seq: int, limit: int
+) -> list[StoredMessage | JobEvent]: ...
+```
+
+The alternatives were a second `job_events_since` on the same Protocol with the merge in the
+handler, and a separate `JobEventLog` Protocol. Both put the handler in the position of knowing that
+resume has two sources, and the second gives it two dependencies for one operation and the suite a
+second fake. "The session log" is a real concept that both tables are part of, and asking for it is
+one question.
+
+Three consequences, none of them free:
+
+- **`messages_since` leaves the Protocol.** Once `chat_handler.py:225` asks for the log, the
+  message-only query has no production caller, and keeping a Protocol method that nothing but a test
+  calls is the same dilution this option exists to avoid. It survives as a private helper inside
+  `PostgresChatRepository`, which is where `log_since` calls it from anyway.
+- **The chat repository reads `job_events`,** which crosses a domain line the name does not
+  advertise. Tolerable because both implementations already live in `adapters/postgres` and share
+  `tables.py` — the line being crossed is a naming one, not a deployment or transaction one — but it
+  is the cost, and it should not be discovered later as an accident.
+- **`MockChatRepository` follows.** It merges two in-memory lists on `seq` instead of one, which is
+  the whole change; the fake stays a fake and the suite stays container-free.
+
+**The return type is rows, not frames.** `core/frames.py` imports `Role` and `Status` *from* the
+repository seam, so the dependency runs frames → repository and cannot run back. `log_since` hands
+back `StoredMessage` and `JobEvent`, and the handler maps each to `message` or `job_status`. That
+also keeps the truncation rule in one place: the handler counts merged entries against
+`ws_resume_max_messages` exactly as it counts messages today, so `resume_too_old` is unchanged in
+shape as well as in meaning.
+
 ## Work, in dependency order
 
 1. **Alembic bootstrap.** No `alembic/` exists yet. Config, env, one initial revision. Decide
@@ -286,6 +342,11 @@ should be a separate, marked suite:
 - **Gap-free allocation under concurrency.** The row-lock argument is only a claim until two
   transactions race for the same session and both land. A fake repository cannot falsify it.
 - **The idempotent insert.** `on conflict` semantics are the database's, not the fake's.
+- **One event row per transition, for all six.** Since `job_events` sits below the `JobQueue`
+  contract, the shared suite is silent about it: add a seventh transition to `PostgresJobStore` and
+  forget its event row and nothing fails. This assertion is what makes that silence safe, so it
+  belongs here as a requirement rather than a note — `insert_or_get`, `cancel`, `claim`,
+  `retire_lapsed`, `ack`, `nack`, each writing exactly one row at the next `seq`.
 
 And the acceptance test itself — kill mid-turn, reconnect, lose nothing — wants the real thing, since
 what it is really testing is that the durable state and the transport agree.
