@@ -23,10 +23,11 @@ architecture of an LLM agent driving real computation, and the reason this proje
 
 **Phase 3 — containerized workers.** Designed ahead of the code in
 [`docs/worker.md`](docs/worker.md). Landed so far: the object store behind a Protocol, the
-`spawn`ed solve child, and the supervisor that holds one lease against one child — reserve, extend
-on a timer, write the artifact, then `ack`. `docker compose up -d --scale worker=2` runs two of
-them. Still to come: progress events on the fanout, and the acceptance script that kills a worker
-mid-solve. No agent and no frontend yet.
+`spawn`ed solve child, the supervisor that holds one lease against one child — reserve, extend on a
+timer, write the artifact, then `ack` — and every job transition as a numbered row a reconnecting
+client replays. `docker compose up -d --scale worker=2` runs two of them. Still to come: the
+`chat.events` fan-out that delivers those transitions live, `cancel`, and the acceptance script that
+kills a worker mid-solve. No agent and no frontend yet.
 
 Roadmap: `1` chat over WebSocket → `2` the job broker on RabbitMQ → **`3` containerized workers** →
 `4` the analytics engine → `5` chat UI → `6` cloud.
