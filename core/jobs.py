@@ -48,6 +48,28 @@ class JobState(StrEnum):
         return self in (JobState.DONE, JobState.DEAD, JobState.CANCELLED)
 
 
+@dataclass(frozen=True, slots=True)
+class JobEvent:
+    """One state transition, as a row in the session's log.
+
+    Not part of the `JobQueue` contract — no method here returns one, and
+    `MemoryJobQueue` never writes one. It lives beside `JobState` because that
+    is what it carries, and `core/chat_repository.py` imports it for
+    `log_since`: a transition is a numbered row in the *chat* sequence space,
+    so resume replays it alongside the messages it happened between. See
+    `docs/persistence.md`.
+
+    `seq` is the whole reason this is a row rather than a message on a bus. A
+    percentage is not a durable fact and gets no number (`job_progress`, phase
+    5); a transition is, and a client that reconnects mid-solve is told every
+    one it missed.
+    """
+
+    seq: int
+    job_id: uuid.UUID
+    state: JobState
+
+
 class StaleLease(Exception):
     """The lease being used is no longer the live one for its job.
 

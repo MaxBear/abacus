@@ -18,22 +18,50 @@ That single constraint is what makes the rest of this document mostly bookkeepin
 
 ## Why WebSocket rather than SSE
 
-Server-sent events plus `POST /messages` is the credible alternative, and it is genuinely easier to
-operate: it is ordinary HTTP, it reconnects itself with `Last-Event-ID`, and every proxy on the path
-already understands it. It is worth naming that, because "we picked WebSocket" usually goes
-undefended.
+Server-sent events plus `POST /messages` is the credible alternative, and for most of what a chat
+app does it is the better one: it is ordinary HTTP, every proxy on the path already understands it,
+and it reconnects itself. **For a chat that only streams tokens, SSE is the right default.** It is
+what the Anthropic and OpenAI streaming APIs use, and what their own web clients use. Picking
+WebSocket for a chat app is a departure from the consensus shape and owes an argument.
 
-WebSocket wins here on three counts:
+The argument is not the usual one. Two reasons commonly given do not survive contact:
 
-- **One stream, several event sources.** A turn produces assistant tokens, job state transitions
-  (`queued → running → done`), and progress from the worker. With SSE these are one event stream
-  that the client must correlate with a separate POST's response. Over a socket they are frames on
-  the same ordered channel, with one sequence number space.
-- **Cancellation is a client→server message.** Stopping an in-flight solve over SSE means a second
-  HTTP call that has to find the right job by ID; over the socket it is `{"type":"cancel"}` on the
-  connection that is already scoped to the session.
-- **It is the phase-6 shape.** Progress streaming from workers is the direction this goes, and
-  retrofitting a bidirectional transport later is worse than paying for it now.
+- **"Cancellation needs a client→server channel."** It does not. The client already holds the
+  `job_id` — it arrived in `job_status` — so `POST /jobs/{id}/cancel` is exactly as cheap as the
+  `POST /messages` that SSE needs anyway.
+- **"It is the shape we will want later."** A bet on future requirements, dressed as a reason.
+
+What survives is that **this stream is session-scoped and outlives any single request.** The vendor
+APIs stream on a response body: it opens with the POST, closes with the turn, and carries only what
+that turn produces. Here a second producer — the worker — emits into the session when no request is
+in flight at all:
+
+- `queued → running` fires when a worker reserves the job, which can be long after the POST
+  returned, while the user sits idle.
+- `failed → running` fires when a backoff elapses (`jobs.md:113`), potentially minutes later.
+- `retire_lapsed` fires from a *different* process' maintenance loop, on behalf of a worker that
+  died holding the lease.
+- A `cancel` issued in one tab has to reach the others.
+
+None of those have a request to ride back on, so the response-body shape cannot carry them. The
+alternative that could is a second, long-lived, session-scoped SSE stream running alongside the
+POST — at which point the operational simplicity SSE was chosen for is largely spent, and the two
+event sources sit on two channels with two orderings for the client to reconcile.
+
+**And `Last-Event-ID` buys less here than it appears to.** Worth being precise, because it is the
+strongest thing SSE has and it is routinely overcredited: the vendor APIs do not implement it — a
+dropped Messages API stream is simply lost, and the client retries the whole request. Where it *is*
+implemented, what it saves is the reconnect loop and the cursor frame
+(`{"type":"resume","last_seq":41}`), not the replay. Replay here is the merged scan over
+`chat_messages` and `job_events` that `persistence.md` specifies, and that scan is identical work
+whichever transport asks for it. `resume_too_old` has no vocabulary in `Last-Event-ID` either; it
+would become a status code on reconnect — workable, but a thing to design rather than a thing
+inherited.
+
+So, plainly: **the socket does not earn itself in phase 1, and is not meant to.** A phase-1-only
+abacus should have been SSE. It earns itself at phase 3, when `job_status` begins arriving from a
+process the client never spoke to — and retrofitting the transport at that point, against a
+persisted sequence space and a live client, is worse than paying for it at the start.
 
 The cost is real and is paid in the operational sections below: proxies idle-timeout silent
 connections, load balancers do not drain them, and there is no `Last-Event-ID` — resume is ours to
@@ -90,7 +118,7 @@ that silently does nothing is indistinguishable, from the client's side, from on
 | `user_message` | `text`, `client_msg_id` | 1a | `client_msg_id` is the client's idempotency key |
 | `ping` | — | 1a | application-level, see [Heartbeats](#heartbeats-and-idle-timeouts) |
 | `resume` | `last_seq` | 1b | sent immediately after reconnect, before anything else |
-| `cancel` | `job_id` | 2 | best-effort; the worker may already be done |
+| `cancel` | `job_id` | 3 | best-effort; the worker may already be done. Authorized against the session — see [Cancellation](#cancellation) |
 
 ### Server → client
 
@@ -102,7 +130,37 @@ that silently does nothing is indistinguishable, from the client's side, from on
 | `message` | `seq`, `message_id`, `role`, `status`, `text` | 1b | one stored message, replayed whole; only `resume` sends it |
 | `error` | `code`, `message`, `retryable` | 1a | application error; the socket stays open |
 | `pong` | — | 1a | |
-| `job_status` | `seq`, `job_id`, `state`, `progress` | 2 | `queued`/`running`/`done`/`failed` |
+| `job_status` | `seq`, `job_id`, `state` | 3 | a transition: `queued`/`running`/`done`/`failed`/`dead`/`cancelled` |
+| `job_progress` | `job_id`, `progress` | 5 | unnumbered and lossy; never replayed |
+
+`job_status` and `job_progress` were one frame in this table until phase 3, carrying `progress` as a
+fourth field alongside `seq`. They are two because **a percentage is not a durable fact** — it is in
+no row, it cannot be reconstructed after a reconnect, and numbering it would mean either an insert
+per tick to mint a number obsolete on arrival, or a hole in a sequence space whose gap-freeness
+`persistence.md` treats as an invariant. `worker.md` argues it at length. The split is the same one
+`delta` already makes below, applied to a second producer: the durable thing gets a number, the
+rendering detail does not.
+
+**`job_progress` is specified here and built in phase 5**, which is the split earning its keep
+rather than a schedule slipping. Everything needed to carry a percentage is machinery phase 3 would
+otherwise have to invent for a number nothing can yet render: the child's contract is exactly one
+message (`worker/child.py:11`), `SolveProcess` reads the pipe once, and `Solver` is
+`payload → Solved` with nowhere to report from. Worse, the only solver that exists is `synthetic`,
+whose progress is exact *because its duration was an input* — designing the protocol against it
+would prove nothing, which is the trap `worker.md` names about cooperative mocks. Phase 5 is the
+first thing with a bar to fill and phase 4 the first with real work to count. Deferring is safe
+precisely because the frames are separate: adding one later is additive under `v1` and touches
+nothing, where a fourth field on `job_status` could not have been added without a version bump.
+
+Note what a client can do without it. `job_status(running)` carries a `seq` and arrives at a known
+moment, so elapsed time is computable client-side with no server support at all — which is most of
+what a progress indicator is for, and honest in a way a synthesised percentage is not.
+
+A transition earns its `seq` the ordinary way — it is a row, in `job_events`, allocated from the
+session's counter at insert, and replayed by the same cursor that replays messages. It is *not* the
+`seq` of the message that caused the job: one message spawns many transitions, and a shared number
+can neither be ordered against the messages between them nor survive a client whose cursor has
+already passed it. `persistence.md` carries the table and the merged resume scan.
 
 `delta` carries `(message_id, chunk_index)` rather than a session `seq`, which is what lets several
 turns stream concurrently on one socket without ambiguity. That question — whether deltas need their
@@ -178,6 +236,13 @@ Under more than one API replica — which is the deployed configuration from pha
 a session's socket is almost never the pod that learns the job finished. The worker publishes
 completion to RabbitMQ; some arbitrary replica consumes it.
 
+Note which half of that is load-bearing. A transition is already a committed row by the time
+anything is published — `job_events`, written in the same transaction as the state change — so the
+bus is delivering news the database has already recorded. Losing a message costs latency and
+nothing else. Progress is the opposite and has no durable half at all, which is exactly why it is a
+separate frame carrying no `seq`: there is nothing for a resume to fall back on, and nothing that
+needs one.
+
 **Every API replica binds an exclusive, auto-delete queue to a fanout exchange** (`chat.events`) at
 startup, and forwards each event to whichever connections for that session it happens to hold
 locally. Replicas holding none discard it. RabbitMQ is already a dependency and already models
@@ -188,6 +253,185 @@ Neither mechanism is durable, and neither needs to be. Durability lives in Postg
 covers every gap the bus leaves — which is exactly why the fan-out layer is allowed to be lossy and
 cheap. Notably this also means **no sticky sessions are required at the load balancer**: any replica
 can serve any reconnect, because state is in the database, not in the pod.
+
+### Who publishes
+
+**`RabbitMQJobQueue` publishes**, from inside the operations it already wraps — `enqueue`, `cancel`,
+`claim`, `ack`, `nack`, `discard` — plus from `_maintain` for `retire_lapsed`. It calls
+`PostgresJobStore` for all of them, so it sees every transition there is, and it is the one class in
+the system that legitimately holds both a store and an AMQP channel.
+
+**It is not a method on the `JobQueue` Protocol.** Publishing is a side effect of the existing
+methods, invisible at the seam; `core/jobs.py:180-313` gains nothing. The Protocol's own rule
+forbids it — *"nothing here is transport, storage, or scheduling policy"* — and a `publish_event` on
+an interface whose other implementation is a dict would be exactly that. `MemoryJobQueue` simply
+does not publish, which costs nothing, because it is the same seam decision that keeps `job_events`
+below the contract.
+
+Two alternatives, rejected:
+
+- **`PostgresJobStore` publishes.** It is where the row is written and would be the smaller change,
+  but a Postgres adapter has no business holding an exchange, and `test_layering.py` exists to say
+  so.
+- **An outbox relay** polling `job_events` for unpublished rows. Genuinely the most robust — it
+  cannot lose a message even if the broker is down at the moment of the transition — and it is
+  machinery this does not need. A lost message costs latency and nothing else, because the row is
+  already committed and resume replays it.
+
+Note the interaction with cancellation: because the API also holds a `RabbitMQJobQueue`
+(`consume=False`, see [Cancellation](#cancellation)), the API-side `queued` transition is published
+by the same class as every worker-side one. There is no second answer to invent for who publishes
+what, which is the argument that settled both.
+
+### The event on the wire
+
+```
+{v, session_id, job_id, seq, state}
+```
+
+**The event is the `job_status` frame, plus routing, plus a version.** `seq`, `job_id` and `state`
+are exactly the frame's fields; `session_id` is how a replica decides whether the event is any of
+its business; `v` is the version. Nothing else.
+
+**It is minimal on purpose.** The alternative is shipping the whole `Job`, and `jobs.payload` is
+JSONB that phase 4 fills with an `AnalysisRequest` — which the API needs none of. This is a *fanout*
+exchange, so every byte is delivered to every replica: payload size is multiplied by the replica
+count, on a path where most copies are discarded on arrival. Anything the API turns out to want
+later is in the `job_events` row, and that row is what resume reads anyway, so the bus is never the
+only way to learn something.
+
+**`session_id` is on the wire rather than looked up from `job_id`.** Delivery is then a dict hit —
+`ConnectionRegistry.for_session` — with no database round trip. That matters because this path runs
+for every event on every replica, so a lookup here would be O(replicas × events) of work whose
+usual answer is "not mine, discard."
+
+**Defined in `core/events.py`**, which both the worker and the API import, and which cannot import
+`aio_pika` (`test_layering.py:28`). The AMQP encoding — exchange, routing, headers — lives in
+`adapters/rabbitmq/events.py`, on the same split as every other seam here.
+
+**Versioned from the first commit**, for the reason frames are, and harder. Worker and API roll
+independently, so during any deploy both versions are on the bus simultaneously; skew is the normal
+condition rather than an incident. And an unknown `v` is a *discard*, not an error — which is safe
+for exactly the reason the fan-out is allowed to be lossy at all: the transition is a committed row,
+so a dropped event costs a client some latency until its next resume, and nothing more. Forward
+incompatibility degrades to slowness instead of to a broken session.
+
+### The API's broker connection
+
+From PR 2 the API holds **two** users of the broker, not one: the `chat.events` consumer above, and
+the producer-only `RabbitMQJobQueue` that [Cancellation](#cancellation) puts in the lifespan. Every
+answer below follows from that pair, and from rules this service already has.
+
+**One connection, two channels.** `RabbitMQJobQueue.start` takes a `url` and opens its own
+`connect_robust` (`adapters/rabbitmq/job_queue.py:153`), which is right for a worker and wrong for an
+API that is already holding one. It grows a `connection` parameter, the lifespan builds a single
+robust connection, and the queue and the consumer each take a channel on it. A second TCP connection
+would buy only what a second channel already gives — isolation between a consumer-side channel error
+and publishing — while adding a second heartbeat stream and, worse, a second thing that can fail
+independently. Sharing collapses "can publish but receives nothing" and its mirror back into one
+fact, which is what lets readiness be a single honest check rather than a partial one. The worker is
+unaffected and keeps `start(url=...)`.
+
+**A pod whose broker is down starts anyway, and reports not-ready.** This is the treatment Postgres
+already gets (`api/main.py:20`): the engine is constructed eagerly so a malformed URL kills the
+process, but no socket is opened, so a dependency outage produces a not-ready pod rather than a
+crash loop. The broker connection follows the same rule — lifespan starts it, a failure to connect
+does not abort startup, and `aio_pika`'s robust connection keeps retrying in the background.
+Refusing to boot would convert a recoverable broker outage into a rolling restart of every replica
+at the moment the system is least able to absorb one.
+
+**`/readyz` inspects the connection this pod holds, not a fresh one.** `broker.ping`
+(`adapters/rabbitmq/broker.py:6`) opens a connection and closes it, deliberately, on the reasoning
+that readiness should measure whether a *new* consumer could connect right now. That was the right
+question while the API held nothing. It is the wrong one the moment the pod holds its own: a fresh
+connect can succeed while this replica's connection is dead, and readiness would report a pod that
+cannot do its job. So the check becomes local state — connection open and not reconnecting, channel
+open, consumer tag held — which is also a probe that costs no handshake, on an endpoint every
+replica serves every few seconds. `broker.ping` has no other caller and goes with the assumption
+behind it.
+
+Note **which half of a broken connection actually hurts**, because it is not the obvious one. A dead
+consumer leaves the pod deaf: it accepts sockets and delivers no `job_status` to them, which is
+degraded but self-healing, since every transition is a committed row and the next `resume` collects
+what was missed. A dead producer leaves it *mute*: `cancel` fails, and from phase 4 so does
+`enqueue`, so a user's message cannot become work at all. Nothing repairs that after the fact. Mute
+is the worse failure, and it is the stronger reason the check watches the shared connection rather
+than the consumer alone.
+
+**On reconnect the queue comes back under a different name, and the gap is lost.** The per-replica
+queue is exclusive and auto-delete with a server-generated name; `aio_pika`'s robust connection
+redeclares on reconnect, so what returns is a *new* queue. Anything published while the connection
+was down reached an exchange with no binding for this replica and is gone. That is harmless for the
+reason everything in this section is harmless — the transition is a committed row and resume repairs
+it — but it is written here because a queue name silently changing in the RabbitMQ console looks
+exactly like a bug the first time someone sees it.
+
+Note how the liveness/readiness split behaves during that gap. `/readyz` fails, so Kubernetes takes
+the pod out of the Service and new connections go elsewhere; `/livez` checks nothing, so the pod is
+not restarted; and the sockets already open stay open, missing events until their next resume. A
+broker blip drains new traffic without killing live sessions, which is the whole point of the two
+probes answering different questions.
+
+Two consequences for existing code, so they are not discovered during the PR.
+`scripts/verify-phase0.sh:15` asserts `/readyz` 200 with dependencies up, which now requires the
+consumer to be bound by the time the script probes rather than merely the broker to be reachable —
+startup ordering, or a retry in the script. And `tests/test_health.py` monkeypatches
+`adapters.rabbitmq.broker.ping` by string in four places; with the check moving onto an object in
+`app.state`, those become an injected fake, which is what `api/deps.py` describes that seam as being
+for.
+
+## Cancellation
+
+`cancel` is the one client→server frame that is not about the chat: it names a `job_id` and asks the
+queue to stop work a worker is doing. It lands in phase 3 rather than phase 2 for a reason that is
+not scheduling — **a client learns a `job_id` only from `job_status`**, so a `cancel` frame shipped
+any earlier would have had nothing to name.
+
+**The API holds a producer-only queue.** `api/main.py`'s lifespan gains a
+`RabbitMQJobQueue.start(..., consume=False)`: it declares topology and can `enqueue` / `cancel` /
+`get`, but does not consume and does not run `_maintain`. The handler depends on the `JobQueue`
+Protocol exactly as it already depends on `ChatRepository` and `Responder`, so `MemoryJobQueue` is
+the test double and no new fake is written. Two consequences, stated rather than left to be
+discovered:
+
+- **The API does not run the orphan sweep.** `_maintain` republishes jobs whose row committed but
+  whose publish did not — findable because `published_at` is null — and a `consume=False` process
+  does not run it. That is fine, since maintenance is not owned by whoever produced the job and any
+  worker repairs any job; but it means an API-side `enqueue` whose publish fails waits for a
+  worker's sweep rather than repairing itself.
+- **Neither `cancel` nor `get` touches the broker.** Both delegate straight to the store
+  (`adapters/rabbitmq/job_queue.py:239` and `:236`); a cancelled job's message stays on the queue
+  and is discarded when someone tries to claim it, because the claim is conditional and the row is
+  the authority. So the AMQP half of this dependency sits idle until phase 4's `enqueue`.
+
+**The handler authorizes; the queue cannot.** `JobQueue.cancel` takes a bare `job_id` and knows
+nothing about sessions — correctly, it is the queue seam — and `jobs.session_id` is nullable. A
+`cancel` naming another session's job, or a job belonging to no session, would otherwise simply
+succeed. So the handler reads before it writes:
+
+```python
+job = await queue.get(job_id)
+if job is None or job.session_id != connection.session_id:
+    # refuse; the frame names something that is not this session's to stop
+await queue.cancel(job_id)
+```
+
+Ownership is of the **session**, not of the connection: any of a session's sockets may cancel any of
+its jobs. That is the same per-session treatment `job_status` gets, and the opposite of `delta`.
+
+This is the only place an untrusted identifier enters either job path, and the asymmetry is worth
+naming. On the fan-out side the `session_id` is read back off a `job_events` row that an
+authenticated handler wrote at enqueue — it has never left the server's storage. On this side the
+`job_id` arrives in a frame. **The whole argument rests on `jobs.session_id` being set from the
+connection at enqueue and never from the request payload.** Phase 4 owns `enqueue` and must keep
+that property: if a client ever supplies its own `session_id`, fan-out silently becomes
+client-controlled routing and nothing here fails loudly.
+
+**The result comes back the ordinary way.** `cancel` gets no bespoke reply. The transition writes a
+`job_events` row and publishes to `chat.events`, and every connection the session holds — on this
+replica or any other — receives `job_status(cancelled)` through the fan-out above. A client that
+cancels twice across a reconnect gets the same answer both times, because `cancel` is a transition
+and an already-terminal job is returned unchanged.
 
 ## Heartbeats and idle timeouts
 
@@ -316,9 +560,10 @@ Two traps, both hit while writing 1a:
 | --- | --- |
 | **1a** | Endpoint, envelope types, connection lifecycle, origin check, backpressure, per-session and per-turn caps, in-memory registry, stub streaming responder. Messages do not survive the connection. |
 | **1b** | Postgres persistence: `chat_sessions` / `chat_messages`, alembic bootstrap, `seq` allocation, `resume`, `client_msg_id` idempotency. |
-| **2** | `job_status` frames sourced from the broker; `cancel`. |
-| **3** | Worker progress events; the RabbitMQ fanout exchange and per-replica queues. |
+| **2** | ~~`job_status` frames sourced from the broker; `cancel`.~~ Neither landed. Phase 2 built the queue beneath them and stopped there, on the grounds `jobs.md` records: both frames need a worker to be about, and there was none until phase 3. Moved down a row rather than quietly dropped. |
+| **3** | `job_events` and the merged resume scan; `job_status` on the wire; the `chat.events` fanout exchange and per-replica queues. `cancel` rides along, since a frame that stops a solve is only honest once something can be stopped. |
 | **4** | The stub responder is replaced by the LLM gateway. Frame shapes do not change — that is the point of designing them against a stub. |
+| **5** | `job_progress`, and the worker-to-child channel that carries it. Here rather than in phase 3 because the analyses that can count their own work are phase 4's, and the bar that renders the count is this phase's. |
 | **6** | Ingress timeouts aligned with the heartbeat interval; the `preStop` drain hook, since lifespan shutdown runs too late to be one. |
 
 ## Open questions
@@ -326,7 +571,14 @@ Two traps, both hit while writing 1a:
 - **Ticket versus cookie** is unresolved and depends on where the phase-5 UI is served from. Ticket
   is the safer default for a separately-hosted frontend.
 - **Multi-tab semantics.** Two sockets on one session do *not* both receive every frame: a turn
-  writes to the connection that started it, and `ConnectionRegistry.for_session` has no caller
-  outside tests until the phase-3 fan-out lands. A second tab sees another tab's turn only by
+  writes to the connection that started it, and a second tab sees another tab's turn only by
   reconnecting or resuming. Whether it should be able to submit while a turn is in flight is a
   product question, not a transport one.
+
+  Phase 3 makes this **inconsistent rather than merely incomplete**, and deliberately so. The
+  fan-out's first caller of `ConnectionRegistry.for_session` delivers `job_status` to *every*
+  connection the replica holds for a session, because the worker publishing it has no connection to
+  prefer — while `delta` and `done` still go only to the socket that started the turn. So after phase 3 one class of frame is per-session and another is
+  per-connection. That is the honest consequence of who produces each, not a decision about tabs;
+  making them agree means answering the product question above, which phase 5 is the first thing
+  entitled to answer.

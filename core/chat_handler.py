@@ -28,12 +28,15 @@ from core.frames import (
     Done,
     Error,
     ErrorCode,
+    JobStatus,
     Message,
     Ping,
     Pong,
     Resume,
+    ServerFrame,
     UserMessage,
 )
+from core.jobs import JobEvent
 from core.responder import Responder
 from core.ws import WS_INTERNAL_ERROR, WS_NORMAL, Connection
 
@@ -218,11 +221,17 @@ class ConnectionHandler:
         rendered state as re-streaming would, in one frame instead of one per
         chunk. Rows come back in `seq` order, so the client applies them by
         appending and its cursor advances monotonically.
+
+        Since phase 3 the log has a second source, and the handler cannot tell:
+        `log_since` returns messages and job transitions already merged on the
+        `seq` both draw from. That is what makes the `chat.events` fan-out an
+        optimisation — a live `job_status` nobody was connected to receive is
+        found here instead.
         """
         limit = self._settings.ws_resume_max_messages
         # One past the bound, so "further behind than we will replay" is
         # answerable from this query rather than from a second count(*).
-        missed = await self._repo.messages_since(self._conn.session_id, frame.last_seq, limit + 1)
+        missed = await self._repo.log_since(self._conn.session_id, frame.last_seq, limit + 1)
 
         if len(missed) > limit:
             # Truncating instead would hand the client a gap it cannot see: it
@@ -231,22 +240,14 @@ class ConnectionHandler:
             self._conn.send(
                 Error(
                     code=ErrorCode.RESUME_TOO_OLD,
-                    message=f"more than {limit} messages since seq {frame.last_seq}",
+                    message=f"more than {limit} entries since seq {frame.last_seq}",
                     retryable=False,
                 )
             )
             return
 
-        for stored in missed:
-            self._conn.send(
-                Message(
-                    seq=stored.seq,
-                    message_id=stored.message_id.hex,
-                    role=stored.role,
-                    status=stored.status,
-                    text=stored.text,
-                )
-            )
+        for entry in missed:
+            self._conn.send(_replayed(entry))
 
     async def _start_turn(self, frame: UserMessage) -> None:
         """Store the message, open a reply, ack both, and spawn the turn.
@@ -357,3 +358,22 @@ class ConnectionHandler:
             await self._repo.fail_assistant_message(message_id)
         except Exception:  # noqa: BLE001 - see above
             log.exception("could not mark message failed (message_id=%s)", message_id)
+
+
+def _replayed(entry: StoredMessage | JobEvent) -> ServerFrame:
+    """The frame for one row of the session log.
+
+    A function rather than a method on the rows themselves: `core/frames.py`
+    imports the row types, so the dependency runs frames → repository and must
+    not run back. Mapping here is what keeps that direction, and it is the same
+    reason `log_since` returns rows instead of frames.
+    """
+    if isinstance(entry, JobEvent):
+        return JobStatus(seq=entry.seq, job_id=entry.job_id.hex, state=entry.state)
+    return Message(
+        seq=entry.seq,
+        message_id=entry.message_id.hex,
+        role=entry.role,
+        status=entry.status,
+        text=entry.text,
+    )

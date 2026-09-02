@@ -2,8 +2,9 @@
 
 Three seams live here, and all three for the same reason: more than one module
 wants them. `test_chat_repository.py` runs the persistence contract against
-Postgres and `test_chat_ws.py`'s acceptance test needs the real database behind
-a real socket; `test_job_queue.py` runs the queue contract against RabbitMQ and
+Postgres, `test_chat_ws.py`'s acceptance test needs the real database behind
+a real socket, and `test_job_events.py` needs the same database under a job
+store; `test_job_queue.py` runs the queue contract against RabbitMQ and
 `test_rabbitmq_job_queue.py` asserts what only that implementation can be asked
 about; `test_object_store.py` asserts what MinIO does with bytes and
 `test_worker_live.py` needs a real bucket for a supervisor to write into.
@@ -35,19 +36,23 @@ def created_sessions() -> list[uuid.UUID]:
     """Session ids a test made, for the postgres fixture to clean up after.
 
     A list rather than a return value so a test and its fixtures can all append
-    to the same registry: `postgres_repo` reads it during teardown, by which
+    to the same registry: `postgres_chat_repo` reads it during teardown, by which
     point whoever created a session is long finished.
     """
     return []
 
 
 @pytest.fixture
-async def postgres_repo(created_sessions):
-    """A repository on the real database, or a skip when none is reachable.
+async def postgres_db():
+    """The real database, or a skip when none is reachable.
 
     Skipping rather than failing is what keeps `make test` container-free while
     leaving one command that covers both situations — `make up && make migrate`
     turns these on with no flag to remember.
+
+    Separate from `postgres_chat_repo` since phase 3, because the job store is a
+    second thing built on a `Database` and `test_job_events.py` wants one
+    without reaching into a repository's privates for it.
     """
     db = Database(get_settings())
     try:
@@ -57,15 +62,42 @@ async def postgres_repo(created_sessions):
         pytest.skip("no postgres reachable — `make up && make migrate` enables these")
 
     try:
-        yield PostgresChatRepository(db)
+        yield db
     finally:
-        # chat_messages goes with it: the FK is ON DELETE CASCADE.
+        await db.dispose()
+
+
+@pytest.fixture
+async def postgres_chat_repo(postgres_db, created_sessions):
+    """A repository on the real database, cleaned up after."""
+    try:
+        yield PostgresChatRepository(postgres_db)
+    finally:
+        # chat_messages, jobs, and job_events go with it: every FK is
+        # ON DELETE CASCADE.
         if created_sessions:
-            async with db.session() as s:
+            async with postgres_db.session() as s:
                 stmt = delete(chat_sessions).where(chat_sessions.c.id.in_(created_sessions))
                 await s.execute(stmt)
                 await s.commit()
-        await db.dispose()
+
+
+@pytest.fixture
+def postgres_job_store(postgres_db) -> PostgresJobStore:
+    """The job store on the real database, for the two modules that want one.
+
+    `test_job_events.py` asserts the event row each of the six transitions
+    writes; `test_chat_repository.py` needs a real transition to stand beside a
+    message in the merged log, and there is no other way to make one — the rows
+    are written inside this store's transactions, deliberately.
+
+    No teardown of its own. Every job belongs to a session, and deleting that
+    session cascades to its jobs and to their events, so cleanup is
+    `postgres_chat_repo`'s: a test using this registers its session in
+    `created_sessions` like any other. A session-less job is the exception and
+    the one test that makes one says so.
+    """
+    return PostgresJobStore(postgres_db)
 
 
 # How often the RabbitMQ adapter's maintenance loop runs under test. Far tighter

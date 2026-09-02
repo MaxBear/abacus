@@ -222,6 +222,46 @@ jobs = Table(
     ),
 )
 
+job_events = Table(
+    "job_events",
+    metadata,
+    # Internal key, sequential — the same argument chat_messages makes. A job
+    # transition has no wire identity of its own: the client addresses the job,
+    # and orders transitions by seq.
+    Column("id", BigInteger, Identity(always=True), primary_key=True),
+    Column("job_id", Uuid(), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False),
+    # Denormalised — reachable through job_id, carried anyway so resume is a
+    # range scan on (session_id, seq) with no join. NOT NULL although
+    # jobs.session_id is nullable: a job with no session has nobody to tell, and
+    # writes no events at all.
+    Column(
+        "session_id",
+        Uuid(),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # From chat_sessions.next_seq, like everything else in the log. This is the
+    # column that makes a transition replayable, and the reason the queue now
+    # touches the chat schema at all — see docs/persistence.md.
+    Column("seq", BigInteger, nullable=False),
+    Column("state", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # One list, not two — and the same trap as the others: autogenerate cannot
+    # see a CHECK change, so adding a state produces an empty migration.
+    CheckConstraint(f"state in ({_quoted(JobState)})", name="state"),
+    # The same constraint chat_messages carries, and it does double duty: the
+    # resume scan's index, and the FK index on session_id. It cannot enforce
+    # gap-freeness across the two tables — nothing can, in the schema — because
+    # they share one allocator and each holds only its own half of the numbers.
+    UniqueConstraint("session_id", "seq"),
+)
+
+# For the FK, not for a query: nothing reads events by job. Postgres does not
+# index a foreign key on its own, and without this, deleting a session makes the
+# cascade from `jobs` scan this table once per job it takes with it.
+Index("ix_job_events_job_id", job_events.c.job_id)
+
+
 # The claim query's index: equality on the state, then the columns it orders by.
 # Partial, because `reserve` looks only at work that is waiting — a table that
 # is mostly finished jobs should not carry them here. `failed` is included

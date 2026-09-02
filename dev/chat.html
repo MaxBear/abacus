@@ -69,6 +69,9 @@
   .msg .txt { padding: 7px 10px; border-radius: 7px; background: var(--user); white-space: pre-wrap; }
   .msg.a .txt { background: transparent; border: 1px solid var(--line); }
   .msg.e .txt { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+  /* A transition is neither a turn nor a failure: dimmed, so it reads as the
+     system talking about a job rather than as something that went wrong. */
+  .msg.j .txt { background: transparent; border: 1px dashed var(--line); color: var(--dim); }
   .msg .meta { font: 10.5px var(--mono); color: var(--dim); margin-top: 3px; }
   footer { padding: 10px 14px; border-top: 1px solid var(--line); background: var(--panel); flex: none; }
   #text { width: 100%; font: 13px system-ui, sans-serif; padding: 7px 9px; border: 1px solid var(--line);
@@ -295,6 +298,16 @@ function handleFrame(data) {
     const el = bubble(mine ? "u" : "a", `${mine ? "you" : "assistant"} · replayed`, f.text);
     el.querySelector(".meta").textContent =
       `seq ${f.seq} · ${f.status}` + (f.status === "failed" ? " — this turn died with its socket" : "");
+    return;
+  }
+
+  if (f.type === "job_status") {
+    // One transition, numbered like a message because it is a row like a
+    // message. Rendered in the transcript rather than only in the frame log so
+    // its position between two turns is visible — that ordering is the whole
+    // reason it draws from the session's allocator.
+    const el = bubble("j", `job · ${f.state}`, f.job_id);
+    el.querySelector(".meta").textContent = `seq ${f.seq}`;
     return;
   }
 

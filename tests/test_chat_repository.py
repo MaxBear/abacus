@@ -21,7 +21,8 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from core.chat_repository import Role, Status
+from core.chat_repository import Role, Status, StoredMessage
+from core.jobs import JobEvent, JobRequest, JobState
 from tests.MockChatRepository import MockChatRepository
 
 
@@ -29,13 +30,44 @@ from tests.MockChatRepository import MockChatRepository
 def repo(request):
     """The contract under test, once per implementation.
 
-    `getfixturevalue` rather than requesting `postgres_repo` outright: naming it
+    `getfixturevalue` rather than requesting `postgres_chat_repo` outright: naming it
     in the signature would build a database connection for the `mock` run too,
     and skip both when none is reachable.
     """
     if request.param == "mock":
         return MockChatRepository()
-    return request.getfixturevalue("postgres_repo")
+    return request.getfixturevalue("postgres_chat_repo")
+
+
+@pytest.fixture
+def add_transition(request, repo):
+    """Put one job transition in the log, however this implementation gets one.
+
+    The two ways differ because the two implementations differ, which is the
+    point: Postgres writes `job_events` from inside `PostgresJobStore`'s
+    transaction and there is no other way in, while the mock has no job store
+    and offers the seam directly. Both end with a `queued` row at the next
+    `seq`, so every assertion above is about the log rather than about how a
+    row got into it.
+    """
+    if isinstance(repo, MockChatRepository):
+
+        async def add(session_id: uuid.UUID) -> uuid.UUID:
+            job_id = uuid.uuid4()
+            repo.record_job_event(session_id, job_id, JobState.QUEUED)
+            return job_id
+
+        return add
+
+    job_store = request.getfixturevalue("postgres_job_store")
+
+    async def add(session_id: uuid.UUID) -> uuid.UUID:
+        job, _created = await job_store.insert_or_get(
+            JobRequest(kind="synthetic", payload={}, session_id=session_id)
+        )
+        return job.id
+
+    return add
 
 
 @pytest.fixture
@@ -118,7 +150,7 @@ async def test_completing_a_turn_stores_the_accumulated_text(repo, session_id):
     assistant = await repo.start_assistant_message(session_id)
     await repo.complete_assistant_message(assistant.message_id, "Hello there")
 
-    (stored,) = await repo.messages_since(session_id, after_seq=0, limit=10)
+    (stored,) = await repo.log_since(session_id, after_seq=0, limit=10)
     assert stored.status == Status.COMPLETE
     assert stored.text == "Hello there"
 
@@ -127,20 +159,20 @@ async def test_a_failed_turn_is_marked_not_left_streaming(repo, session_id):
     assistant = await repo.start_assistant_message(session_id)
     await repo.fail_assistant_message(assistant.message_id)
 
-    (stored,) = await repo.messages_since(session_id, after_seq=0, limit=10)
+    (stored,) = await repo.log_since(session_id, after_seq=0, limit=10)
     # Left at streaming, a client renders a half-sentence under a spinner that
     # never resolves, indistinguishable from a turn still in flight.
     assert stored.status == Status.FAILED
 
 
-async def test_messages_since_is_ordered_exclusive_and_bounded(repo, session_id):
+async def test_log_since_is_ordered_exclusive_and_bounded(repo, session_id):
     for n in range(5):
         await repo.record_user_message(session_id, f"c{n}", f"m{n}")
 
-    assert [m.seq for m in await repo.messages_since(session_id, 0, 10)] == [1, 2, 3, 4, 5]
-    assert [m.seq for m in await repo.messages_since(session_id, 2, 10)] == [3, 4, 5]
-    assert [m.seq for m in await repo.messages_since(session_id, 0, 2)] == [1, 2]
-    assert await repo.messages_since(session_id, 5, 10) == []
+    assert [m.seq for m in await repo.log_since(session_id, 0, 10)] == [1, 2, 3, 4, 5]
+    assert [m.seq for m in await repo.log_since(session_id, 2, 10)] == [3, 4, 5]
+    assert [m.seq for m in await repo.log_since(session_id, 0, 2)] == [1, 2]
+    assert await repo.log_since(session_id, 5, 10) == []
 
 
 async def test_another_sessions_messages_are_never_returned(repo, created_sessions):
@@ -150,7 +182,7 @@ async def test_another_sessions_messages_are_never_returned(repo, created_sessio
     await repo.ensure_session(theirs)
     await repo.record_user_message(theirs, "c1", "not yours")
 
-    assert await repo.messages_since(mine, 0, 10) == []
+    assert await repo.log_since(mine, 0, 10) == []
 
 
 async def test_an_unknown_session_raises_rather_than_inventing_one(repo):
@@ -159,14 +191,72 @@ async def test_an_unknown_session_raises_rather_than_inventing_one(repo):
 
 
 # --------------------------------------------------------------------------
+# The log's second source (phase 3)
+# --------------------------------------------------------------------------
+
+
+async def test_the_log_interleaves_transitions_with_the_messages_around_them(
+    repo, session_id, add_transition
+):
+    """One log, two tables — which is the whole reason `log_since` is one method.
+
+    The interleaving is the assertion. Both sources draw from one allocator, so
+    a transition that happened between two messages comes back between them,
+    and a client applying the replay in order sees what actually happened.
+    """
+    await repo.record_user_message(session_id, "c1", "run the backtest")
+    job_id = await add_transition(session_id)
+    await repo.record_user_message(session_id, "c2", "and again")
+
+    entries = await repo.log_since(session_id, 0, 10)
+
+    assert [e.seq for e in entries] == [1, 2, 3]
+    assert [type(e) for e in entries] == [StoredMessage, JobEvent, StoredMessage]
+    assert entries[1].job_id == job_id
+    assert entries[1].state == JobState.QUEUED
+
+
+async def test_the_bound_applies_to_the_merged_log_not_to_each_source(
+    repo, session_id, add_transition
+):
+    """Two of each, a bound of three: the first three entries, whatever they are.
+
+    A `limit` applied per source would return four, which is the bug a merge
+    written as two independently-bounded lists concatenated does not have — and
+    the one written as two lists sliced *after* the merge does not either, as
+    long as the slice comes last.
+    """
+    await repo.record_user_message(session_id, "c1", "one")
+    await add_transition(session_id)
+    await repo.record_user_message(session_id, "c2", "two")
+    await add_transition(session_id)
+
+    assert [e.seq for e in await repo.log_since(session_id, 0, 3)] == [1, 2, 3]
+    # And the cursor is exclusive on both sides of the merge.
+    assert [e.seq for e in await repo.log_since(session_id, 2, 10)] == [3, 4]
+
+
+async def test_another_sessions_transitions_are_never_returned(
+    repo, created_sessions, add_transition
+):
+    mine, theirs = uuid.uuid4(), uuid.uuid4()
+    created_sessions.extend([mine, theirs])
+    await repo.ensure_session(mine)
+    await repo.ensure_session(theirs)
+    await add_transition(theirs)
+
+    assert await repo.log_since(mine, 0, 10) == []
+
+
+# --------------------------------------------------------------------------
 # Postgres only: what the mock cannot falsify
 # --------------------------------------------------------------------------
 
 
 @pytest.fixture
-def pg(postgres_repo):
+def pg(postgres_chat_repo):
     """The shared postgres fixture, under the short name these tests read with."""
-    return postgres_repo
+    return postgres_chat_repo
 
 
 @pytest.fixture
@@ -225,6 +315,6 @@ async def test_racing_the_same_client_msg_id_stores_one_row(pg, pg_session):
     assert len({r.message.message_id for r in recorded}) == 1
     assert len({r.message.seq for r in recorded}) == 1
 
-    stored = await pg.messages_since(pg_session, 0, 10)
+    stored = await pg.log_since(pg_session, 0, 10)
     assert len(stored) == 1
     assert stored[0].seq == 1, "the seven losers must not have burned numbers"

@@ -9,10 +9,10 @@ answers which (`core/chat_handler.py`), or what fills a reply
 (`core/responder.py`). Those depend on this module; it depends on none of them.
 
 Only the frames the server actually honors are defined. `cancel` and
-`job_status` (2) are specified in docs/websocket.md but deliberately absent
-here: a `cancel` that parses and silently does nothing is indistinguishable,
-from the client's side, from one that worked. An unknown `type` is rejected as
-a bad frame, which is a truthful answer until the phase that implements it.
+`job_progress` are specified in docs/websocket.md but deliberately absent here:
+a `cancel` that parses and silently does nothing is indistinguishable, from the
+client's side, from one that worked. An unknown `type` is rejected as a bad
+frame, which is a truthful answer until the phase that implements it.
 """
 
 from enum import StrEnum
@@ -25,6 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 # module follows. `message` replays a stored row, so its vocabulary is the
 # row's; inventing a parallel set of strings is how the two drift.
 from core.chat_repository import Role, Status
+
+# Same rule, one table further: `job_status` replays a `job_events` row, so its
+# vocabulary is that row's.
+from core.jobs import JobState
 
 # Bumped only for breaking changes. It rides on every frame from the first
 # commit because retrofitting a version field requires a flag day: there is no
@@ -202,4 +206,30 @@ class Message(_ServerFrame):
     text: str
 
 
-ServerFrame = Ack | Delta | Done | Error | Pong | Message
+class JobStatus(_ServerFrame):
+    """One job transition. Sent live, and replayed by resume.
+
+    A durable fact, so it carries a `seq` — its own row in `job_events`, drawn
+    from the same per-session allocator every message uses. That is what lets
+    the phase-3 fan-out be lossy: a client that missed this frame asks `resume`
+    and is told, because the row committed in the same transaction as the state
+    change it reports.
+
+    Not the `seq` of the message that caused the job. One message spawns several
+    transitions, and a shared number could neither be ordered against the
+    messages between them nor survive a client whose cursor has already passed
+    it — which is a spinner that never stops rather than a rendering nuisance.
+
+    `progress` is deliberately not a field here. A percentage is in no row and
+    cannot be reconstructed after a reconnect, so it ships unnumbered as
+    `job_progress` in phase 5 — additive under v1 precisely because these are
+    two frames rather than one with a sometimes-meaningful `seq`.
+    """
+
+    type: Literal["job_status"] = "job_status"
+    seq: int
+    job_id: str
+    state: JobState
+
+
+ServerFrame = Ack | Delta | Done | Error | Pong | Message | JobStatus
